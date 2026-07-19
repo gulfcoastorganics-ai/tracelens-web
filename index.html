@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#111827" />
+  <title>TraceLens Web</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div>
+        <p class="eyebrow">TRACE ASSISTANT</p>
+        <h1>TraceLens</h1>
+      </div>
+      <button id="resetButton">Reset</button>
+    </header>
+
+    <section class="stage" id="stage">
+      <video id="camera" autoplay playsinline muted></video>
+      <img id="overlay" alt="Reference overlay" />
+      <div class="grid" id="grid"></div>
+
+      <div class="empty-state" id="emptyState">
+        <strong>Load a reference image</strong>
+        <span>Then drag it over the camera view.</span>
+      </div>
+    </section>
+
+    <section class="controls">
+      <label class="file-button">
+        Choose overlay
+        <input id="imageInput" type="file" accept="image/*" />
+      </label>
+
+      <button id="cameraButton">Start camera</button>
+      <button id="gridButton">Grid</button>
+      <button id="flipButton">Flip</button>
+
+      <label class="slider">
+        <span>Opacity</span>
+        <input id="opacityInput" type="range" min="0.05" max="1" step="0.05" value="0.55" />
+      </label>
+
+      <label class="slider">
+        <span>Scale</span>
+        <input id="scaleInput" type="range" min="0.25" max="3" step="0.05" value="1" />
+      </label>
+
+      <label class="slider">
+        <span>Rotation</span>
+        <input id="rotationInput" type="range" min="-180" max="180" step="1" value="0" />
+      </label>
+    </section>
+
+    <p class="status" id="status">Choose an overlay image to begin.</p>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
