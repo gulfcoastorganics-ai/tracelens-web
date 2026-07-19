@@ -1,4 +1,4 @@
-const DEFAULT_STATE = Object.freeze({ x: 0, y: 0, scale: 1, rotation: 0, opacity: 0.55, flipped: false, blendMode: "Normal", guide: "none", physicalCalibration: null });
+const DEFAULT_STATE = Object.freeze({ x: 0, y: 0, scale: 1, rotation: 0, opacity: 0.55, flipped: false, blendMode: "Normal", guide: "none", physicalCalibration: null, perspective: null, trace: { enabled: false, mode: "Original", settings: {}, stage: 0, focus: null, contourProgress: {} } });
 
 function newId() {
   return globalThis.crypto?.randomUUID?.() || `layer-${Date.now()}-${Math.random().toString(16).slice(2)}`;

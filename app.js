@@ -9,7 +9,7 @@ import { applyBlendMode } from "./blend-modes.js";
 import { MeasurementGuides } from "./measurement-guides.js";
 import { Diagnostics } from "./diagnostics.js";
 import { getWorkflowPreset } from "./workflow-presets.js";
-import { createProjectBundle, validateProjectBundle, downloadProjectBundle } from "./project-bundles.js";
+import { createProjectBundle, validateProjectBundle, migrateProjectBundle, downloadProjectBundle } from "./project-bundles.js";
 import { CalibrationProfiles } from "./calibration-profiles.js";
 import { SessionTimeline } from "./session-timeline.js";
 import { PerspectiveSession } from "./perspective-session.js";
@@ -17,6 +17,7 @@ import { CALIBRATION_REFERENCES, calculateCalibration, fromMillimeters } from ".
 import { GestureCoach } from "./onboarding.js";
 import { registerPWA } from "./pwa.js";
 import { createLayer, duplicateLayer, cloneLayers } from "./layers.js";
+import { TraceEngine, resultToDataUrl } from "./trace-engine.js";
 
 const camera = document.querySelector("#camera");
 const overlay = document.querySelector("#overlay");
@@ -81,6 +82,8 @@ const layerVisibility = document.querySelector("#layerVisibility");
 const layerLock = document.querySelector("#layerLock");
 const layerAdd = document.querySelector("#layerAdd");
 const layersList = document.querySelector("#layersList");
+const layersToggle = document.querySelector("#layersToggle");
+const layersCount = document.querySelector("#layersCount");
 const selectionFrame = document.querySelector("#selectionFrame");
 const gestureHint = document.querySelector("#gestureHint");
 const zoomReadout = document.querySelector("#zoomReadout");
@@ -92,6 +95,24 @@ const rotationOutput = document.querySelector("#rotationOutput");
 const opacityNumber = document.querySelector("#opacityNumber");
 const scaleNumber = document.querySelector("#scaleNumber");
 const rotationNumber = document.querySelector("#rotationNumber");
+const positionXNumber = document.querySelector("#positionXNumber");
+const positionYNumber = document.querySelector("#positionYNumber");
+const blendSwatches = document.querySelector("#blendSwatches");
+const traceModeInput = document.querySelector("#traceModeInput");
+const traceStrengthInput = document.querySelector("#traceStrengthInput");
+const traceStrengthOutput = document.querySelector("#traceStrengthOutput");
+const traceThresholdInput = document.querySelector("#traceThresholdInput");
+const traceThresholdOutput = document.querySelector("#traceThresholdOutput");
+const traceBlurInput = document.querySelector("#traceBlurInput");
+const traceBlurOutput = document.querySelector("#traceBlurOutput");
+const traceBackgroundInput = document.querySelector("#traceBackgroundInput");
+const traceStageInput = document.querySelector("#traceStageInput");
+const traceFocusShapeInput = document.querySelector("#traceFocusShapeInput");
+const traceOutsideOpacityInput = document.querySelector("#traceOutsideOpacityInput");
+const traceResetButton = document.querySelector("#traceResetButton");
+const traceProcessing = document.querySelector("#traceProcessing");
+const layerTraceMode = document.querySelector("#layerTraceMode");
+const traceFocusWindow = document.querySelector("#traceFocusWindow");
 const presetChips = document.querySelector("#presetChips");
 const status = document.querySelector("#status");
 
@@ -112,8 +133,12 @@ let gestureFrame = 0;
 let physicalCalibration = null;
 let lastTapAt = 0;
 let longPressTimer = null;
+let lastAdjustFocus = null;
 let autoPerspectiveScanning = false;
 let latestSurfaceDiagnostics = {};
+const traceResults = new Map();
+let traceDebounceTimer = 0;
+let traceRequestToken = 0;
 const vision = new VisionUtils();
 const perspectiveSolver = new PerspectiveSolver();
 const snapController = new OverlaySnapController(perspectiveOverlay);
@@ -125,6 +150,7 @@ const diagnostics = new Diagnostics(diagnosticsOutput);
 const calibrationProfiles = new CalibrationProfiles();
 const timeline = new SessionTimeline();
 const gestureCoach = new GestureCoach(gestureCoachElement, { reducedMotion: typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches });
+const traceEngine = new TraceEngine({ onStatus: update => { if (traceProcessing) traceProcessing.hidden = update.state !== "processing"; if (update.state === "fallback") console.warn("[TraceLens trace] worker unavailable; using main thread", update.detail); } });
 const adaptiveOpacity = new AdaptiveOpacityController({ analyzer: vision, onOpacity: (value, metrics) => { opacity = value; opacityInput.value = value; renderOverlay(); perspectiveOverlay.style.opacity = value; } });
 const surfaceTracker = new SurfaceTracker({ onUpdate: result => {
   if (!workspaceImage) return;
@@ -163,25 +189,42 @@ function perspectiveFeedback(result = {}) {
   return "Scanning surface…";
 }
 
+const DEFAULT_TRACE = Object.freeze({ enabled: false, mode: "Original", settings: { strength: .55, threshold: .48, blur: 1, background: "transparent", levels: 5, focusShape: "none", outsideOpacity: 25 }, stage: 0, contourProgress: {} });
+function traceState(layer) { layer.trace = { ...DEFAULT_TRACE, ...(layer.trace || {}), settings: { ...DEFAULT_TRACE.settings, ...(layer.trace?.settings || {}) } }; return layer.trace; }
+function applyTraceControls(layer) {
+  const trace = traceState(layer); traceModeInput.value = trace.mode; traceStrengthInput.value = trace.settings.strength; traceThresholdInput.value = trace.settings.threshold; traceBlurInput.value = trace.settings.blur; traceBackgroundInput.value = trace.settings.background; traceStageInput.value = trace.stage ?? 0; traceFocusShapeInput.value = trace.settings.focusShape || "none"; traceOutsideOpacityInput.value = trace.settings.outsideOpacity ?? 25; updateTraceOutputs(); updateFocusWindow(trace); if (layerTraceMode) layerTraceMode.textContent = trace.mode;
+}
+function updateTraceOutputs() { traceStrengthOutput.textContent = `${Math.round(Number(traceStrengthInput.value) * 100)}%`; traceThresholdOutput.textContent = `${Math.round(Number(traceThresholdInput.value) * 100)}%`; traceBlurOutput.textContent = traceBlurInput.value; }
+function captureTraceControls(layer) { const trace = traceState(layer); trace.mode = traceModeInput.value; trace.enabled = trace.mode !== "Original"; trace.stage = Number(traceStageInput.value) || 0; trace.settings = { ...trace.settings, strength: Number(traceStrengthInput.value), threshold: Number(traceThresholdInput.value), blur: Number(traceBlurInput.value), background: traceBackgroundInput.value, focusShape: traceFocusShapeInput.value, outsideOpacity: Number(traceOutsideOpacityInput.value) || 0 }; return trace; }
+function updateFocusWindow(trace = traceState(activeLayer() || { trace: DEFAULT_TRACE })) { const shape = trace.settings.focusShape || "none"; traceFocusWindow.hidden = !workspaceImage || shape === "none"; traceFocusWindow.dataset.shape = shape; traceFocusWindow.style.setProperty("--outside-opacity", String(Math.max(0, Math.min(1, (trace.settings.outsideOpacity ?? 25) / 100)))); }
+function traceSettings(layer) { const trace = traceState(layer); return { mode: trace.mode, ...trace.settings, stage: trace.stage }; }
+async function refreshTraceView(layer) {
+  if (!layer || layer.id !== activeLayerId || document.hidden) return;
+  const trace = traceState(layer); traceRequestToken += 1; const token = traceRequestToken; applyTraceControls(layer); if (!trace.enabled || trace.mode === "Original") { traceResults.delete(layer.id); overlay.src = layer.image; renderOverlay(); return; }
+  try { const result = await traceEngine.process(layer.image, traceSettings(layer)); if (token !== traceRequestToken || layer.id !== activeLayerId || result.cancelled) return; const dataUrl = await resultToDataUrl(result, trace.settings.background, trace.mode); traceResults.set(layer.id, { dataUrl, key: result.key }); trace.cacheKey = result.key; overlay.src = dataUrl; renderOverlay(); } catch (error) { trace.enabled = false; trace.mode = "Original"; overlay.src = layer.image; status.textContent = "Trace Assist could not process this image. Original restored."; console.error("[TraceLens trace] processing failed", error); }
+}
+function queueTraceRefresh() { const layer = activeLayer(); if (!layer) return; captureTraceControls(layer); applyTraceControls(layer); updateFocusWindow(layer.trace); window.clearTimeout(traceDebounceTimer); traceDebounceTimer = window.setTimeout(() => refreshTraceView(layer), 160); }
+
 function activeLayer() { return layers.find(layer => layer.id === activeLayerId) || null; }
-function legacyLayer(project, name) { return createLayer({ image: project.image, name, x: project.x, y: project.y, scale: project.scale, rotation: project.rotation, opacity: project.opacity, flipped: project.flipped, blendMode: project.blendMode, guide: project.guide, physicalCalibration: project.physicalCalibration, locked: project.locks?.position }); }
+function legacyLayer(project, name) { return createLayer({ image: project.image, name, x: project.x, y: project.y, scale: project.scale, rotation: project.rotation, opacity: project.opacity, flipped: project.flipped, blendMode: project.blendMode, guide: project.guide, physicalCalibration: project.physicalCalibration, perspective: project.perspective ? { enabled: true, locked: Boolean(project.perspectiveLocked), quad: project.perspective } : null, locked: project.locks?.position }); }
 
 function syncActiveLayer() {
   const layer = activeLayer();
   if (!layer) return;
-  Object.assign(layer, { x, y, scale, rotation, opacity, flipped, blendMode: blendModeInput.value, guide: guideInput.value, physicalCalibration, visible: !overlay.hidden, locked: locks.position });
+  Object.assign(layer, { x, y, scale, rotation, opacity, flipped, blendMode: blendModeInput.value, guide: guideInput.value, physicalCalibration, trace: traceState(layer), perspective: perspectiveActive && activePerspectiveQuad ? { enabled: true, locked: surfaceTracker.locked, quad: activePerspectiveQuad.map(point => ({ ...point })) } : null, visible: !overlay.hidden, locked: locks.position });
 }
 
 function loadLayerState(layer) {
   if (!layer) return;
   activeLayerId = layer.id; workspaceImage = layer.image; x = Number(layer.x) || 0; y = Number(layer.y) || 0; scale = Number(layer.scale) || 1; rotation = Number(layer.rotation) || 0; opacity = Number(layer.opacity) || .55; flipped = Boolean(layer.flipped);
-  blendModeInput.value = layer.blendMode || "Normal"; guideInput.value = layer.guide || "none"; guides.setMode(guideInput.value); physicalCalibration = layer.physicalCalibration || null; opacityInput.value = opacity; scaleInput.value = scale; rotationInput.value = rotation;
-  overlay.src = workspaceImage; overlay.hidden = layer.visible === false; overlay.style.display = layer.visible === false ? "none" : "block"; overlay.style.visibility = "visible"; layerThumb.src = workspaceImage; layerName.textContent = layer.name; applyLocks({ position: Boolean(layer.locked) });
+  blendModeInput.value = layer.blendMode || "Normal"; guideInput.value = layer.guide || "none"; guides.setMode(guideInput.value); physicalCalibration = layer.physicalCalibration || null; opacityInput.value = opacity; scaleInput.value = scale; rotationInput.value = rotation; positionXNumber.value = Math.round(x); positionYNumber.value = Math.round(y); blendSwatches?.querySelectorAll("[data-blend]").forEach(button => button.classList.toggle("active", button.dataset.blend === blendModeInput.value));
+  activePerspectiveQuad = layer.perspective?.quad ? layer.perspective.quad.map(point => ({ ...point })) : null; perspectiveActive = Boolean(activePerspectiveQuad?.length === 4); surfaceTracker.locked = Boolean(layer.perspective?.locked); if (perspectiveActive) { overlay.style.display = "none"; snapController.snap(workspaceImage, perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); } else { overlay.style.display = layer.visible === false ? "none" : "block"; snapController.clear(); }
+  overlay.src = layer.image; overlay.hidden = layer.visible === false; overlay.style.display = layer.visible === false ? "none" : "block"; overlay.style.visibility = "visible"; layerThumb.src = workspaceImage; layerName.textContent = layer.name; applyLocks({ position: Boolean(layer.locked) }); applyTraceControls(layer); refreshTraceView(layer);
 }
 
 function renderLayerElement(element, layer, index) {
   const flip = layer.flipped ? -1 : 1;
-  element.src = layer.image; element.hidden = layer.visible === false; element.style.display = layer.visible === false ? "none" : "block"; element.style.opacity = layer.opacity; element.style.transform = `translate(${layer.x}px, ${layer.y}px) scale(${layer.scale * flip}, ${layer.scale}) rotate(${layer.rotation}deg)`; element.style.mixBlendMode = layer.blendMode.toLowerCase(); element.style.zIndex = String(index + 1);
+  element.src = traceResults.get(layer.id)?.dataUrl || layer.image; element.hidden = layer.visible === false; element.style.display = layer.visible === false ? "none" : "block"; element.style.opacity = layer.opacity; element.style.transform = `translate(${layer.x}px, ${layer.y}px) scale(${layer.scale * flip}, ${layer.scale}) rotate(${layer.rotation}deg)`; element.style.mixBlendMode = layer.blendMode.toLowerCase(); element.style.zIndex = String(index + 1);
 }
 
 function renderLayers(refreshList = false) {
@@ -203,10 +246,11 @@ function renderLayers(refreshList = false) {
 
 function renderLayerList() {
   if (!layersList) return;
+  if (layersCount) layersCount.textContent = layers.length;
   layersList.replaceChildren(...[...layers].reverse().map((layer, reverseIndex) => {
     const row = document.createElement("div"); row.className = `layer-row${layer.id === activeLayerId ? " active" : ""}`; row.dataset.layerId = layer.id;
     row.innerHTML = `<button class="layer-row-main" type="button"><img alt=""><span><strong></strong><small></small></span></button><button class="layer-row-action layer-row-visibility" type="button" aria-label="Toggle visibility">${layer.visible === false ? "⊘" : "◉"}</button><button class="layer-row-action layer-row-lock" type="button" aria-label="Toggle lock">${layer.locked ? "🔒" : "♧"}</button><button class="layer-row-action layer-row-up" type="button" aria-label="Move layer up">↑</button><button class="layer-row-action layer-row-down" type="button" aria-label="Move layer down">↓</button><button class="layer-row-action layer-row-duplicate" type="button" aria-label="Duplicate layer">⧉</button><button class="layer-row-action layer-row-delete" type="button" aria-label="Delete layer">×</button>`;
-    row.querySelector("img").src = layer.image; row.querySelector("strong").textContent = layer.name; row.querySelector("small").textContent = `${Math.round(layer.opacity * 100)}% · ${layer.blendMode}`;
+    row.querySelector("img").src = layer.thumbnail || layer.image; row.querySelector("strong").textContent = layer.name; const trace = traceState(layer); row.querySelector("small").textContent = `${Math.round(layer.opacity * 100)}% · ${layer.blendMode}${layer.perspective ? " · Perspective" : ""}${trace.enabled ? ` · ${trace.mode}` : ""}`;
     return row;
   }));
 }
@@ -219,7 +263,7 @@ function confirmPerspectiveLock() {
   const candidate = perspectiveSession.candidate || surfaceTracker.getLockCandidate();
   if (!candidate || !perspectiveSession.confirm() || !surfaceTracker.lock()) return false;
   autoPerspectiveScanning = false; autoPerspectiveButton.classList.remove("active"); activePerspectiveQuad = candidate.quad.map(point => ({ ...point })); perspectiveActive = true;
-  snapController.snap(workspaceImage, perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); overlay.style.display = "none"; selectionFrame.classList.add("surface-found"); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; status.textContent = "Perspective locked."; visionStatus.textContent = "Perspective locked · Tracking"; addTimeline("Perspective Locked"); updateContext(); return true;
+  snapController.snap(workspaceImage, perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); overlay.style.display = "none"; selectionFrame.classList.add("surface-found"); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; syncActiveLayer(); status.textContent = "Perspective locked."; visionStatus.textContent = "Perspective locked · Tracking"; addTimeline("Perspective Locked"); updateContext(); return true;
 }
 
 function renderOverlay() {
@@ -233,6 +277,9 @@ function renderOverlay() {
   if (opacityNumber) opacityNumber.value = Math.round(opacity * 100);
   if (scaleNumber) scaleNumber.value = Math.round(scale * 100);
   if (rotationNumber) rotationNumber.value = rotation;
+  if (positionXNumber) positionXNumber.value = Math.round(x);
+  if (positionYNumber) positionYNumber.value = Math.round(y);
+  blendSwatches?.querySelectorAll("[data-blend]").forEach(button => button.classList.toggle("active", button.dataset.blend === blendModeInput.value));
   zoomReadout.textContent = `Zoom ${scale.toFixed(2)}×`;
   rotationReadout.textContent = `${rotation}°`;
   if (perspectiveOverlay && !perspectiveOverlay.hidden) perspectiveOverlay.style.opacity = opacity;
@@ -252,7 +299,7 @@ function applyState(next) {
 }
 function pushHistory() { if (workspaceImage) history.push(captureState()); }
 function addTimeline(type, detail = "") { timeline.add(type, detail); const latest = timeline.latest(); timelineOutput.textContent = latest ? `${latest.type}${latest.detail ? ` · ${latest.detail}` : ""}` : "Session ready."; }
-function applyLocks(saved = {}) { Object.keys(locks).forEach(key => { if (typeof locks[key] === "boolean") locks[key] = Boolean(saved[key]); const input = document.querySelector(`[data-lock="${key}"]`); if (input) input.checked = locks[key]; }); stage.classList.toggle("locked", locks.position); layerLock.textContent = locks.position ? "♙" : "♧"; }
+function applyLocks(saved = {}) { Object.keys(locks).forEach(key => { if (typeof locks[key] === "boolean") locks[key] = Boolean(saved[key]); const input = document.querySelector(`[data-lock="${key}"]`); if (input) input.checked = locks[key]; }); stage.classList.toggle("locked", locks.position); layerLock.textContent = locks.position ? "♙" : "♧"; layerLock.setAttribute("aria-label", locks.position ? "Unlock overlay" : "Lock overlay"); }
 function applyProject(project) {
   if (!project?.image) return;
   currentProjectId = project.id || null; projectNameInput.value = project.name || "Untitled project"; emptyState.style.display = "none"; layerCard.hidden = false; selectionFrame.classList.add("visible"); showOverlayTools();
@@ -260,7 +307,7 @@ function applyProject(project) {
   setLayers(restoredLayers, project.activeLayerId || restoredLayers.at(-1).id);
   if (project.preset) { presetInput.value = project.preset; applyPreset(project.preset, false); } applyState(project); applyLocks(project.locks); updateContext(); pushHistory(); surfaceTracker.start(camera);
 }
-async function refreshProjectList() { try { let projects = await projectLibrary.all(); const query = projectSearchInput.value.trim().toLowerCase(); if (query) projects = projects.filter(project => project.name.toLowerCase().includes(query) || (project.preset || "").toLowerCase().includes(query)); const sort = projectSortInput.value; projects.sort((a, b) => sort === "name" ? a.name.localeCompare(b.name) : sort === "created" ? b.createdAt - a.createdAt : sort === "favorite" ? Number(b.favorite) - Number(a.favorite) || b.updatedAt - a.updatedAt : b.updatedAt - a.updatedAt); projectList.replaceChildren(new Option(projects.length ? "Projects" : "No projects yet", ""), ...projects.map(project => new Option(`${project.favorite ? "★ " : ""}${project.name} · ${new Date(project.updatedAt).toLocaleDateString()}`, project.id))); } catch (error) { console.error("[TraceLens projects] list failed", error); status.textContent = "Project storage is unavailable."; } }
+async function refreshProjectList() { try { let projects = await projectLibrary.all(); const query = projectSearchInput.value.trim().toLowerCase(); if (query) projects = projects.filter(project => (project.name || "").toLowerCase().includes(query) || (project.preset || "").toLowerCase().includes(query)); const sort = projectSortInput.value; projects.sort((a, b) => sort === "name" ? (a.name || "").localeCompare(b.name || "") : sort === "created" ? b.createdAt - a.createdAt : sort === "favorite" ? Number(b.favorite) - Number(a.favorite) || b.updatedAt - a.updatedAt : b.updatedAt - a.updatedAt); projectList.replaceChildren(new Option(projects.length ? "Projects" : "No projects yet", ""), ...projects.map(project => new Option(`${project.favorite ? "★ " : ""}${project.name || "Untitled project"} · ${new Date(project.updatedAt || Date.now()).toLocaleDateString()}`, project.id))); } catch (error) { console.error("[TraceLens projects] list failed", error); status.textContent = "Project storage is unavailable. Try again."; } }
 function applyPreset(name, announce = true) { const preset = getWorkflowPreset(name); presetInput.value = name; opacity = preset.opacity; opacityInput.value = opacity; blendModeInput.value = preset.blendMode; guideInput.value = preset.guide; guides.setMode(preset.guide); grid.style.backgroundSize = `${100 / preset.gridSpacing}% ${100 / preset.gridSpacing}%`; surfaceTracker.state.retainAt = preset.tracking.weakAt; surfaceTracker.state.acquireAt = Math.max(72, preset.tracking.weakAt + 12); surfaceTracker.state.lostAt = preset.tracking.lostAt; renderOverlay(); updatePresetChips(); if (announce) { status.textContent = `${name} workspace active.`; addTimeline("Preset", name); } }
 function applyPhysicalCalibration() {
   const reference = CALIBRATION_REFERENCES[calibrationReference.value];
@@ -293,7 +340,8 @@ async function saveProject() {
   if (!workspaceImage) { status.textContent = "Import an image before saving a project."; return; }
   const name = projectNameInput.value.trim() || "Untitled project";
   currentProjectId ||= globalThis.crypto?.randomUUID?.() || `project-${Date.now()}`;
-  await projectLibrary.put({ id: currentProjectId, name, image: workspaceImage, layers: captureLayers(), activeLayerId, preset: presetInput.value, perspective: surfaceTracker.locked ? activePerspectiveQuad : null, perspectiveLocked: surfaceTracker.locked, ...captureState(), locks: { ...locks }, updatedAt: Date.now(), thumbnail: await projectLibrary.thumbnail(workspaceImage) });
+  const savedLayers = captureLayers(); await Promise.all(savedLayers.map(async layer => { if (!layer.thumbnail) layer.thumbnail = await projectLibrary.thumbnail(layer.image); }));
+  await projectLibrary.put({ id: currentProjectId, name, image: workspaceImage, layers: savedLayers, activeLayerId, preset: presetInput.value, perspective: surfaceTracker.locked ? activePerspectiveQuad : null, perspectiveLocked: surfaceTracker.locked, ...captureState(), locks: { ...locks }, updatedAt: Date.now(), thumbnail: await projectLibrary.thumbnail(workspaceImage) });
   await refreshProjectList(); addTimeline("Saved", name);
   status.textContent = `Project “${name}” saved.`;
 }
@@ -322,6 +370,9 @@ async function startCamera() {
     if (stream) stream.getTracks().forEach(track => track.stop());
     stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: cameraFacing } }, audio: false });
     camera.srcObject = stream;
+    stream.getTracks().forEach(track => track.addEventListener("ended", () => {
+      if (camera.srcObject === stream) { cameraState.textContent = "CAMERA STOPPED"; status.textContent = "Camera stopped. Tap restart to try again."; }
+    }));
     camera.classList.toggle("selfie-camera", cameraFacing === "user");
     cameraState.textContent = "CAMERA ACTIVE";
     status.textContent = "Camera active.";
@@ -336,6 +387,8 @@ async function startCamera() {
 
 function loadImage(file) {
   if (!file) return;
+  if (!file.type?.startsWith("image/")) { status.textContent = "Choose a supported image file."; return; }
+  if (file.size > 25 * 1024 * 1024) { status.textContent = "That image is larger than 25 MB. Choose a smaller file."; return; }
   const reader = new FileReader();
   reader.onload = () => {
     snapController.clear();
@@ -344,6 +397,7 @@ function loadImage(file) {
     syncActiveLayer();
     const newLayer = createLayer({ image: reader.result, name: file.name.replace(/\.[^/.]+$/, "") });
     setLayers([...layers, newLayer], newLayer.id);
+    projectLibrary.thumbnail(reader.result).then(thumbnail => { const layer = layers.find(item => item.id === newLayer.id); if (layer) layer.thumbnail = thumbnail; renderLayerList(); }).catch(error => console.warn("[TraceLens layers] thumbnail generation failed", error));
     overlay.style.display = "block";
     overlay.hidden = false;
     layerVisibility.textContent = "◉";
@@ -358,12 +412,12 @@ function loadImage(file) {
     updateContext();
     surfaceTracker.start(camera);
   };
-  reader.onerror = () => { status.textContent = "Could not read that image."; };
+  reader.onerror = () => { status.textContent = "Could not read that image. Try another file."; console.error("[TraceLens import] FileReader failed", reader.error); };
   reader.readAsDataURL(file);
 }
 
-imageInput?.addEventListener("change", event => loadImage(event.target.files?.[0]));
-dockImageInput?.addEventListener("change", event => loadImage(event.target.files?.[0]));
+imageInput?.addEventListener("change", event => { loadImage(event.target.files?.[0]); event.target.value = ""; });
+dockImageInput?.addEventListener("change", event => { loadImage(event.target.files?.[0]); event.target.value = ""; });
 opacityInput.addEventListener("input", event => { opacity = Number(event.target.value); renderOverlay(); });
 opacityInput.addEventListener("change", () => renderLayerList());
 scaleInput.addEventListener("input", event => { if (!locks.canEdit("scale")) return; scale = Number(event.target.value); renderOverlay(); });
@@ -377,6 +431,8 @@ function setNumericTransform(target, value) {
 opacityNumber?.addEventListener("change", event => setNumericTransform(opacityInput, Number(event.target.value) / 100));
 scaleNumber?.addEventListener("change", event => setNumericTransform(scaleInput, Number(event.target.value) / 100));
 rotationNumber?.addEventListener("change", event => setNumericTransform(rotationInput, Number(event.target.value)));
+positionXNumber?.addEventListener("change", event => { if (!locks.canEdit("position")) return; x = Number(event.target.value) || 0; renderOverlay(); });
+positionYNumber?.addEventListener("change", event => { if (!locks.canEdit("position")) return; y = Number(event.target.value) || 0; renderOverlay(); });
 document.querySelectorAll("[data-step-target]").forEach(button => button.addEventListener("click", () => {
   const target = document.querySelector(`#${button.dataset.stepTarget}`);
   if (target) setNumericTransform(target, Number(target.value) + Number(button.dataset.step));
@@ -385,8 +441,8 @@ cameraButton.addEventListener("click", startCamera);
 cameraFacingButton?.addEventListener("click", () => { cameraFacing = cameraFacing === "environment" ? "user" : "environment"; globalThis.localStorage?.setItem("tracelens-camera-facing", cameraFacing); startCamera(); });
 gridButton.addEventListener("click", () => { grid.classList.toggle("visible"); gridButton.classList.toggle("active"); });
 flipButton.addEventListener("click", () => { flipped = !flipped; flipButton.classList.toggle("active", flipped); renderOverlay(); });
-adjustButton.addEventListener("click", () => { adjustSheet.classList.toggle("open"); adjustSheet.setAttribute("aria-hidden", !adjustSheet.classList.contains("open")); stage.classList.toggle("adjust-open", adjustSheet.classList.contains("open")); });
-closeAdjust.addEventListener("click", () => { adjustSheet.classList.remove("open"); adjustSheet.setAttribute("aria-hidden", "true"); stage.classList.remove("adjust-open"); });
+adjustButton.addEventListener("click", () => { const opening = !adjustSheet.classList.contains("open"); if (opening) lastAdjustFocus = document.activeElement; adjustSheet.classList.toggle("open", opening); adjustSheet.setAttribute("aria-hidden", String(!opening)); stage.classList.toggle("adjust-open", opening); if (opening) window.setTimeout(() => closeAdjust.focus(), 0); });
+closeAdjust.addEventListener("click", () => { adjustSheet.classList.remove("open"); adjustSheet.setAttribute("aria-hidden", "true"); stage.classList.remove("adjust-open"); if (lastAdjustFocus?.focus) lastAdjustFocus.focus(); });
 replayHelpButton.addEventListener("click", () => gestureCoach.replay());
 coachClose.addEventListener("click", () => gestureCoach.dismiss());
 applyCalibrationButton.addEventListener("click", applyPhysicalCalibration);
@@ -396,17 +452,21 @@ presetChips?.addEventListener("click", event => { const button = event.target.cl
 projectSearchInput.addEventListener("input", refreshProjectList);
 projectSortInput.addEventListener("change", refreshProjectList);
 saveProjectButton.addEventListener("click", () => { saveProject().catch(error => { status.textContent = "Project storage unavailable."; console.warn(error); }); });
-loadProjectButton.addEventListener("click", async () => { const project = await projectLibrary.get(projectList.value); if (project) { applyProject(project); addTimeline("Loaded", project.name); status.textContent = `Project “${project.name}” loaded.`; } });
+loadProjectButton.addEventListener("click", async () => { try { const project = await projectLibrary.get(projectList.value); if (project) { applyProject(project); addTimeline("Loaded", project.name || "Project"); status.textContent = `Project “${project.name || "Project"}” loaded.`; } } catch (error) { status.textContent = "That project could not be loaded. It may be corrupted."; console.error("[TraceLens projects] load failed", error); } });
 duplicateProjectButton.addEventListener("click", async () => { const project = await projectLibrary.get(projectList.value); if (!project) return; currentProjectId = globalThis.crypto?.randomUUID?.() || `project-${Date.now()}`; projectNameInput.value = `${project.name} copy`; await saveProject(); await refreshProjectList(); });
 favoriteProjectButton.addEventListener("click", async () => { if (!projectList.value) return; const project = await projectLibrary.get(projectList.value); if (project) { await projectLibrary.patch(project.id, { favorite: !project.favorite }); await refreshProjectList(); } });
 deleteProjectButton.addEventListener("click", async () => { if (!projectList.value) return; if (window.confirm("Archive this project?")) { await projectLibrary.patch(projectList.value, { archived: true }); await refreshProjectList(); status.textContent = "Project archived on this device."; } });
 exportProjectButton.addEventListener("click", async () => { if (!projectList.value) { status.textContent = "Select a project to export."; return; } const project = await projectLibrary.get(projectList.value); if (project) { downloadProjectBundle(createProjectBundle(project), `${project.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.json`); addTimeline("Exported", project.name); } });
-importProjectInput.addEventListener("change", event => { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = async () => { try { const bundle = JSON.parse(reader.result); if (!validateProjectBundle(bundle)) throw new Error("Unsupported project bundle"); const project = { ...bundle.project, id: `${bundle.project.name || "Imported project"}-${Date.now()}`, updatedAt: Date.now() }; await projectLibrary.put(project); applyProject(project); await refreshProjectList(); addTimeline("Imported", project.name); status.textContent = `Project “${project.name}” imported.`; } catch (error) { status.textContent = "That project bundle is not compatible."; console.warn(error); } }; reader.readAsText(file); });
+importProjectInput.addEventListener("change", event => { const file = event.target.files?.[0]; event.target.value = ""; if (!file) return; if (file.size > 30 * 1024 * 1024) { status.textContent = "That project bundle is too large."; return; } const reader = new FileReader(); reader.onload = async () => { try { const bundle = JSON.parse(reader.result); const migrated = migrateProjectBundle(bundle); if (!migrated || !validateProjectBundle(migrated)) throw new Error("Unsupported project bundle"); const project = { ...migrated.project, id: `${migrated.project.name || "Imported project"}-${Date.now()}`, updatedAt: Date.now() }; await projectLibrary.put(project); applyProject(project); await refreshProjectList(); addTimeline("Imported", project.name || "Project"); status.textContent = `Project “${project.name || "Project"}” imported.`; } catch (error) { status.textContent = "That project bundle is not compatible. Choose a TraceLens export."; console.warn("[TraceLens import] bundle failed", error); } }; reader.onerror = () => { status.textContent = "Could not read that project bundle."; }; reader.readAsText(file); });
 saveProfileButton.addEventListener("click", () => { calibrationProfiles.save(profileInput.value, { preset: presetInput.value, perspective: activePerspectiveQuad, state: captureState(), locks: { ...locks } }); status.textContent = `Calibration “${profileInput.value}” saved.`; });
 undoButton.addEventListener("click", () => { const state = history.undo(); if (state) { applyState(state); status.textContent = "Undo applied."; } });
 redoButton.addEventListener("click", () => { const state = history.redo(); if (state) { applyState(state); status.textContent = "Redo applied."; } });
 blendModeInput.addEventListener("change", () => { renderOverlay(); pushHistory(); });
+blendSwatches?.addEventListener("click", event => { const button = event.target.closest("[data-blend]"); if (!button) return; blendModeInput.value = button.dataset.blend; renderOverlay(); pushHistory(); });
 guideInput.addEventListener("change", event => { guides.setMode(event.target.value); pushHistory(); });
+traceModeInput?.addEventListener("change", queueTraceRefresh);
+[traceStrengthInput, traceThresholdInput, traceBlurInput, traceBackgroundInput, traceStageInput, traceFocusShapeInput, traceOutsideOpacityInput].forEach(input => input?.addEventListener("input", () => { updateTraceOutputs(); queueTraceRefresh(); }));
+traceResetButton?.addEventListener("click", () => { const layer = activeLayer(); if (!layer) return; layer.trace = { ...DEFAULT_TRACE, settings: { ...DEFAULT_TRACE.settings } }; applyTraceControls(layer); refreshTraceView(layer); status.textContent = "Trace Assist reset."; });
 diagnosticsInput.addEventListener("change", event => { diagnosticsOutput.hidden = !event.target.checked; updateContext(); });
 document.querySelectorAll("[data-lock]").forEach(input => input.addEventListener("change", event => { locks.toggle(event.target.dataset.lock); status.textContent = `${event.target.dataset.lock} ${event.target.checked ? "locked" : "unlocked"}.`; }));
 autoOpacityInput.addEventListener("change", event => { adaptiveOpacity.setEnabled(event.target.checked); if (event.target.checked) status.textContent = "Auto Opacity active."; });
@@ -415,10 +475,11 @@ autoPerspectiveButton.addEventListener("click", () => {
   if (autoPerspectiveScanning) { surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; autoPerspectiveButton.classList.remove("active"); visionStatus.textContent = "Manual mode"; status.textContent = "Surface scan cancelled."; updateContext(); return; }
   autoPerspectiveScanning = true; surfaceTracker.beginScan(); perspectiveSession.beginScan(); surfaceTracker.start(camera); autoPerspectiveButton.classList.add("active"); visionStatus.textContent = "Scanning surface…"; status.textContent = "Scanning surface. Hold steady."; updateContext();
 });
-manualPerspectiveButton.addEventListener("click", () => { surfaceTracker.unlock(); surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; activePerspectiveQuad = [{ x: .08, y: .08 }, { x: .92, y: .08 }, { x: .92, y: .92 }, { x: .08, y: .92 }]; perspectiveActive = true; autoPerspectiveButton.classList.remove("active"); overlay.style.display = "none"; snapController.snap(workspaceImage, perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; status.textContent = "Manual mode · adjust corners."; visionStatus.textContent = "Manual mode"; updateContext(); });
-layerVisibility.addEventListener("click", () => { overlay.hidden = !overlay.hidden; layerVisibility.textContent = overlay.hidden ? "⊘" : "◉"; });
-layerLock.addEventListener("click", () => { locks.toggle("position"); stage.classList.toggle("locked", locks.position); layerLock.textContent = locks.position ? "♙" : "♧"; });
+manualPerspectiveButton.addEventListener("click", () => { surfaceTracker.unlock(); surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; activePerspectiveQuad = [{ x: .08, y: .08 }, { x: .92, y: .08 }, { x: .92, y: .92 }, { x: .08, y: .92 }]; perspectiveActive = true; autoPerspectiveButton.classList.remove("active"); overlay.style.display = "none"; snapController.snap(workspaceImage, perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; syncActiveLayer(); status.textContent = "Manual mode · adjust corners."; visionStatus.textContent = "Manual mode"; updateContext(); });
+layerVisibility.addEventListener("click", () => { overlay.hidden = !overlay.hidden; const layer = activeLayer(); if (layer) layer.visible = !overlay.hidden; layerVisibility.textContent = overlay.hidden ? "⊘" : "◉"; layerVisibility.setAttribute("aria-label", overlay.hidden ? "Show overlay" : "Hide overlay"); });
+layerLock.addEventListener("click", () => { locks.toggle("position"); const layer = activeLayer(); if (layer) layer.locked = locks.position; stage.classList.toggle("locked", locks.position); layerLock.textContent = locks.position ? "♙" : "♧"; layerLock.setAttribute("aria-label", locks.position ? "Unlock overlay" : "Lock overlay"); });
 layerAdd?.addEventListener("click", () => dockImageInput?.click());
+layersToggle?.addEventListener("click", () => { const collapsed = layersList.hidden; layersList.hidden = !collapsed; layersToggle.setAttribute("aria-expanded", String(collapsed)); layersToggle.lastChild.textContent = collapsed ? "⌃" : "⌄"; });
 layersList?.addEventListener("click", event => {
   const row = event.target.closest("[data-layer-id]"); if (!row) return;
   const id = row.dataset.layerId; const layer = layers.find(item => item.id === id); if (!layer) return;
@@ -426,7 +487,7 @@ layersList?.addEventListener("click", event => {
   if (action.includes("visibility")) { layer.visible = layer.visible === false; if (id === activeLayerId) { overlay.hidden = !layer.visible; overlay.style.display = layer.visible ? "block" : "none"; } renderLayers(true); return; }
   if (action.includes("lock")) { layer.locked = !layer.locked; if (id === activeLayerId) applyLocks({ position: layer.locked }); renderLayers(true); return; }
   if (action.includes("duplicate")) { syncActiveLayer(); const copy = duplicateLayer(layer); layers.splice(layers.indexOf(layer) + 1, 0, copy); setLayers(layers, copy.id); status.textContent = `${copy.name} duplicated.`; return; }
-  if (action.includes("delete")) { if (layers.length === 1) { status.textContent = "Keep at least one reference layer."; return; } const index = layers.indexOf(layer); layers.splice(index, 1); setLayers(layers, layers[Math.max(0, index - 1)]?.id || layers[0].id); status.textContent = `${layer.name} deleted.`; return; }
+  if (action.includes("delete")) { if (layers.length === 1) { status.textContent = "Keep at least one reference layer."; return; } if (!window.confirm(`Delete layer “${layer.name}”?`)) return; traceResults.delete(layer.id); traceEngine.clearLayerCache(layer.image); const index = layers.indexOf(layer); layers.splice(index, 1); setLayers(layers, layers[Math.max(0, index - 1)]?.id || layers[0].id); status.textContent = `${layer.name} deleted.`; return; }
   if (action.includes("up") || action.includes("down")) { const index = layers.indexOf(layer); const nextIndex = action.includes("up") ? Math.min(layers.length - 1, index + 1) : Math.max(0, index - 1); if (index !== nextIndex) [layers[index], layers[nextIndex]] = [layers[nextIndex], layers[index]]; renderLayers(true); return; }
   if (event.target.closest(".layer-row-main")) { syncActiveLayer(); surfaceTracker.unlock(); perspectiveSession.cancel(); perspectiveActive = false; activePerspectiveQuad = null; loadLayerState(layer); renderOverlay(); selectionFrame.classList.add("visible"); status.textContent = `${layer.name} selected.`; }
 });
@@ -447,7 +508,7 @@ compareButton.addEventListener("pointerleave", () => { if (comparing) setCompari
 function distance(a, b) { return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY); }
 function angle(a, b) { return Math.atan2(b.clientY - a.clientY, b.clientX - a.clientX) * 180 / Math.PI; }
 stage.addEventListener("pointerdown", event => {
-  if (!overlay.src || stage.classList.contains("locked")) return;
+  if (!overlay.src || (locks.position && locks.rotation && locks.scale && locks.perspective)) return;
   wakeHUD(); gestureCoach.dismiss();
   const now = performance.now();
   if (now - lastTapAt < 320) { x = 0; y = 0; renderOverlay(); status.textContent = "Overlay centered."; }
@@ -472,9 +533,11 @@ stage.addEventListener("pointerup", endPointer); stage.addEventListener("pointer
 stage.addEventListener("pointerup", () => window.clearTimeout(longPressTimer));
 stage.addEventListener("pointercancel", () => { window.clearTimeout(longPressTimer); pointers.clear(); gestureStart = null; dragging = false; });
 window.addEventListener("blur", () => { window.clearTimeout(longPressTimer); pointers.clear(); gestureStart = null; dragging = false; });
-document.addEventListener("visibilitychange", () => { if (document.hidden) { surfaceTracker.stop(); } else if (camera.srcObject && workspaceImage) surfaceTracker.start(camera); });
+document.addEventListener("visibilitychange", () => { if (document.hidden) { traceEngine.cancel(); surfaceTracker.stop(); } else if (camera.srcObject && workspaceImage) { surfaceTracker.start(camera); const layer = activeLayer(); if (layer?.trace?.enabled) refreshTraceView(layer); } });
 window.addEventListener("keydown", event => { if (event.key === "Escape" && adjustSheet.classList.contains("open")) { closeAdjust.click(); } });
-function requestVisionFrame(now = performance.now()) { diagnostics.frame(); if (workspaceImage && !document.hidden) adaptiveOpacity.update(camera, now); diagnostics.render({ tracking: surfaceTracker.state.confidence, camera: camera.videoWidth ? `${camera.videoWidth}×${camera.videoHeight}` : "—", quality: perspectiveActive ? "perspective" : "high", ...latestSurfaceDiagnostics }); requestAnimationFrame(requestVisionFrame); }
+let visionFrameId = 0;
+let visionLoopStarted = false;
+function requestVisionFrame(now = performance.now()) { diagnostics.frame(); if (workspaceImage && !document.hidden && camera.srcObject) adaptiveOpacity.update(camera, now); diagnostics.render({ tracking: surfaceTracker.state.confidence, camera: camera.videoWidth ? `${camera.videoWidth}×${camera.videoHeight}` : "—", quality: perspectiveActive ? "perspective" : "high", trace: diagnosticsInput.checked ? traceEngine.diagnostics() : null, ...latestSurfaceDiagnostics }); visionFrameId = requestAnimationFrame(requestVisionFrame); }
 
 function initializeCoreUI() {
   const required = { stage, camera, cameraState, status, imageInput, dockImageInput, cameraButton };
@@ -513,7 +576,7 @@ try {
   initializeCamera();
   initializeOptionalSystems();
   registerPWA({ onUpdate: () => status.textContent = "Update available. Reload when ready." });
-  requestVisionFrame();
+  if (!visionLoopStarted) { visionLoopStarted = true; requestVisionFrame(); }
 } catch (error) {
   console.error("[TraceLens core] initialization failed", error);
   if (status) status.textContent = "TraceLens could not initialize. Refresh and try again.";

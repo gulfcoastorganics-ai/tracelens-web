@@ -22,11 +22,12 @@
     </header>
 
     <section class="stage" id="stage" aria-label="Camera canvas">
-      <video id="camera" autoplay playsinline muted></video>
+      <video id="camera" autoplay playsinline muted aria-label="Live camera preview"></video>
       <img id="overlay" alt="Reference overlay" />
       <canvas id="perspectiveOverlay" aria-hidden="true" hidden></canvas>
       <div class="measurement-guides" id="measurementGuides" aria-hidden="true"></div>
       <div class="selection-frame" id="selectionFrame" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      <div class="trace-focus-window" id="traceFocusWindow" aria-hidden="true" hidden></div>
       <div class="grid" id="grid"></div>
       <div class="reticle" aria-hidden="true"><i></i><i></i><i></i><i></i><span></span></div>
 
@@ -37,7 +38,7 @@
       </div>
       <div class="gesture-coach" id="gestureCoach" hidden role="status"><button class="coach-close" id="coachClose" aria-label="Dismiss gesture help">×</button><strong>Quick gestures</strong><span>Drag to move · pinch to resize · twist to rotate</span><small>Hold Before to compare</small></div>
 
-      <div class="empty-state" id="emptyState">
+      <div class="empty-state" id="emptyState" role="region" aria-label="Import a reference image">
         <div class="empty-icon">＋</div>
         <strong>Bring a reference into view</strong>
         <span>Import an image to start tracing</span>
@@ -49,14 +50,15 @@
 
       <div class="layer-card" id="layerCard" hidden>
         <div class="layer-thumb"><img id="layerThumb" alt="" /></div>
-        <div class="layer-info"><strong id="layerName">Reference image</strong><span>Overlay · <b id="opacityValue">55%</b></span></div>
+        <div class="layer-info"><strong id="layerName">Reference image</strong><span>Overlay · <b id="opacityValue">55%</b> · <em id="layerTraceMode">Original</em></span></div>
         <button class="layer-action" id="layerVisibility" aria-label="Hide overlay">◉</button>
         <button class="layer-action" id="layerLock" aria-label="Lock overlay">♧</button>
         <button class="layer-action" id="layerAdd" aria-label="Import another layer">＋</button>
+        <button class="layers-toggle" id="layersToggle" type="button" aria-expanded="true">Layers <b id="layersCount">1</b>⌃</button>
         <div class="layers-list" id="layersList" aria-label="Layers"></div>
       </div>
 
-      <div class="gesture-hint" id="gestureHint">Drag to position · Pinch to scale</div>
+      <div class="gesture-hint" id="gestureHint" role="status">Drag to position · Pinch to scale</div>
       <div class="canvas-readout canvas-readout-left" id="zoomReadout">Zoom 1.00×</div>
       <div class="canvas-readout canvas-readout-right" id="rotationReadout">0°</div>
     </section>
@@ -70,7 +72,9 @@
         <label class="slider overlay-control"><span><span>Rotation</span><span class="precision-value"><button type="button" data-step-target="rotationInput" data-step="-1" aria-label="Decrease rotation">−</button><input id="rotationNumber" type="number" min="-180" max="180" step="1" value="0" aria-label="Rotation in degrees" /><span>°</span><button type="button" data-step-target="rotationInput" data-step="1" aria-label="Increase rotation">+</button></span><output id="rotationOutput" class="sr-only">0°</output></span><input id="rotationInput" type="range" min="-180" max="180" step="1" value="0" /></label>
         <div class="feature-row perspective-control"><button class="feature-button" id="autoPerspectiveButton">⌁ Auto Perspective</button><button class="feature-button" id="manualPerspectiveButton">Manual corners</button><label class="toggle-control"><input id="autoOpacityInput" type="checkbox" /><span class="toggle-track"></span><span>Auto Opacity</span></label></div>
         <div class="feature-row lock-row"><span class="feature-label">Locks</span><label class="lock-control"><input data-lock="position" type="checkbox" /> Position</label><label class="lock-control"><input data-lock="rotation" type="checkbox" /> Rotation</label><label class="lock-control"><input data-lock="scale" type="checkbox" /> Scale</label><label class="lock-control"><input data-lock="perspective" type="checkbox" /> Perspective</label></div>
-        <div class="feature-row"><label class="select-control">Blend <select id="blendModeInput"><option>Normal</option><option>Multiply</option><option>Screen</option><option>Overlay</option><option>Darken</option><option>Lighten</option><option>Difference</option></select></label><label class="select-control">Guides <select id="guideInput"><option value="none">None</option><option value="center">Center</option><option value="thirds">Thirds</option><option value="golden">Golden ratio</option><option value="square">Square grid</option></select></label></div>
+        <div class="feature-row overlay-control"><label class="select-control blend-control">Blend <select id="blendModeInput"><option>Normal</option><option>Multiply</option><option>Screen</option><option>Overlay</option><option>Darken</option><option>Lighten</option><option>Difference</option></select><span class="blend-swatches" id="blendSwatches" role="group" aria-label="Blend mode"><button type="button" data-blend="Normal" aria-label="Normal blend">N</button><button type="button" data-blend="Multiply" aria-label="Multiply blend">M</button><button type="button" data-blend="Screen" aria-label="Screen blend">S</button><button type="button" data-blend="Overlay" aria-label="Overlay blend">O</button><button type="button" data-blend="Darken" aria-label="Darken blend">D</button><button type="button" data-blend="Lighten" aria-label="Lighten blend">L</button><button type="button" data-blend="Difference" aria-label="Difference blend">Δ</button></span></label><label class="select-control">Guides <select id="guideInput"><option value="none">None</option><option value="center">Center</option><option value="thirds">Thirds</option><option value="golden">Golden ratio</option><option value="square">Square grid</option></select></label></div>
+        <div class="feature-row position-control overlay-control"><span class="feature-label">Position</span><label class="precision-position">X <input id="positionXNumber" type="number" step="1" value="0" aria-label="Layer X position in pixels" /> px</label><label class="precision-position">Y <input id="positionYNumber" type="number" step="1" value="0" aria-label="Layer Y position in pixels" /> px</label></div>
+        <div class="trace-assist-panel overlay-control" id="traceAssistPanel"><div class="trace-heading"><span class="feature-label">Trace Assist</span><span class="trace-processing" id="traceProcessing" role="status" aria-live="polite" hidden>Processing…</span></div><div class="trace-mode-row"><label class="select-control">Mode <select id="traceModeInput"><option>Original</option><option>Clean Lines</option><option>Detailed Lines</option><option>Silhouette</option><option>High Contrast</option><option>Grayscale</option><option>Posterize</option><option>Inverted Lines</option><option>Structure</option><option>Custom</option></select></label><button class="feature-button" id="traceResetButton" type="button">Reset trace</button></div><div class="trace-advanced" id="traceAdvanced"><label class="slider">Line strength <output id="traceStrengthOutput">55%</output><input id="traceStrengthInput" type="range" min="0" max="1" step="0.05" value="0.55" /></label><label class="slider">Threshold <output id="traceThresholdOutput">48%</output><input id="traceThresholdInput" type="range" min="0.05" max="0.95" step="0.05" value="0.48" /></label><label class="slider">Smoothing <output id="traceBlurOutput">1</output><input id="traceBlurInput" type="range" min="0" max="3" step="1" value="1" /></label><label class="select-control trace-background">Background <select id="traceBackgroundInput"><option value="transparent">Transparent</option><option value="white">White</option><option value="black">Black</option></select></label><label class="select-control trace-stage">Stage <select id="traceStageInput"><option value="0">Composition</option><option value="1">Primary forms</option><option value="2">Secondary forms</option><option value="3">Fine detail</option><option value="4">Tonal guide</option></select></label><div class="feature-row trace-focus-row"><label class="select-control">Focus <select id="traceFocusShapeInput"><option value="none">None</option><option value="circle">Circle</option><option value="rectangle">Rectangle</option><option value="horizontal">Horizontal band</option><option value="vertical">Vertical band</option></select></label><label class="precision-position">Outside <input id="traceOutsideOpacityInput" type="number" min="0" max="100" step="5" value="25" aria-label="Outside focus opacity percentage" />%</label></div></div></div>
         <div class="feature-row project-row"><input class="project-name" id="projectNameInput" value="Untitled project" maxlength="40" aria-label="Project name" /><button class="feature-button" id="saveProjectButton">Save project</button><button class="feature-button" id="undoButton">Undo</button><button class="feature-button" id="redoButton">Redo</button></div>
         <div class="feature-row project-row"><input class="project-search" id="projectSearchInput" type="search" placeholder="Search projects" aria-label="Search projects" /><select class="project-sort" id="projectSortInput" aria-label="Sort projects"><option value="updated">Recent</option><option value="created">Created</option><option value="name">A–Z</option><option value="favorite">Favorites</option></select></div>
         <div class="feature-row project-row"><select class="project-list" id="projectList" aria-label="Saved projects"><option value="">Projects</option></select><button class="feature-button" id="loadProjectButton">Load</button><button class="feature-button" id="duplicateProjectButton">Duplicate</button><button class="feature-button" id="favoriteProjectButton">☆</button><button class="feature-button" id="deleteProjectButton">Archive</button><button class="feature-button" id="exportProjectButton">Export</button><label class="feature-button import-project">Import<input id="importProjectInput" type="file" accept="application/json,.json" /></label></div>
@@ -94,7 +98,7 @@
       </nav>
     </section>
 
-    <p class="status" id="status">Ready when you are.</p>
+    <p class="status" id="status" role="status" aria-live="polite">Ready when you are.</p>
   </main>
   <script type="module" src="app.js"></script>
 </body>
