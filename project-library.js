@@ -8,8 +8,8 @@ export class ProjectLibrary {
     this.dbPromise = new Promise((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, 3);
       request.onupgradeneeded = event => { const store = request.result.objectStoreNames.contains(STORE_NAME) ? request.transaction.objectStore(STORE_NAME) : request.result.createObjectStore(STORE_NAME, { keyPath: "id" }); if (event.oldVersion < 3) { const cursorRequest = store.openCursor(); cursorRequest.onsuccess = () => { const cursor = cursorRequest.result; if (!cursor) return; const value = cursor.value; cursor.update({ createdAt: value.createdAt || value.updatedAt || Date.now(), updatedAt: value.updatedAt || value.createdAt || Date.now(), favorite: Boolean(value.favorite), archived: Boolean(value.archived), schemaVersion: value.schemaVersion || 1, ...value }); cursor.continue(); }; } };
-      request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
-    });
+      request.onsuccess = () => { const db = request.result; db.onversionchange = () => { db.close(); this.dbPromise = null; }; resolve(db); }; request.onerror = () => reject(request.error); request.onblocked = () => reject(new Error("Project database upgrade is blocked."));
+    }).catch(error => { this.dbPromise = null; throw error; });
     return this.dbPromise;
   }
   async put(project) { if (!project?.id) throw new Error("Project id is required"); const db = await this.open(); return new Promise((resolve, reject) => { const now = Date.now(); const tx = db.transaction(STORE_NAME, "readwrite"); tx.objectStore(STORE_NAME).put({ createdAt: project.createdAt || now, updatedAt: project.updatedAt || now, favorite: false, archived: false, schemaVersion: 2, ...project }); tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); }); }

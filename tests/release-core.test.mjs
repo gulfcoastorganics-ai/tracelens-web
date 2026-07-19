@@ -3,6 +3,7 @@ import { createProjectBundle, migrateProjectBundle, validateProjectBundle } from
 import { HistoryStack } from "../history.js";
 import { applyBlendMode, BLEND_MODES } from "../blend-modes.js";
 import { calculateCalibration, fromMillimeters, toMillimeters } from "../physical-calibration.js";
+import { readFileSync } from "node:fs";
 
 const project = { id: "p1", name: "Test", image: "data:image/png;base64,test", layers: [{ id: "l1", image: "data:image/png;base64,test" }] };
 const bundle = createProjectBundle(project);
@@ -24,4 +25,20 @@ assert.equal(toMillimeters(1, "in"), 25.4);
 assert.equal(fromMillimeters(25.4, "in"), 1);
 const calibration = calculateCalibration({ referenceWidth: 210, referenceHeight: 297, quad: [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }], desiredWidth: 420, unit: "mm" });
 assert.equal(calibration.desiredHeightMm, 594);
+const pwa = readFileSync(new URL("../pwa.js", import.meta.url), "utf8");
+const sw = readFileSync(new URL("../sw.js", import.meta.url), "utf8");
+const app = readFileSync(new URL("../app.js", import.meta.url), "utf8");
+assert.match(pwa, /SKIP_WAITING/);
+assert.match(pwa, /controllerchange/);
+assert.match(sw, /skipWaiting/);
+assert.match(sw, /trace-queue\.js/);
+assert.match(sw, /trace-presets\.js/);
+assert.match(sw, /trace-analysis\.js/);
+assert.match(sw, /trace-masks\.js/);
+assert.match(app, /function bindEventListeners\(\)/);
+assert.match(app, /listenersBound/);
+assert.match(app, /resolveOverlayDisplay/);
+assert.match(app, /queueVisibleTraceLayers/);
+assert.match(app, /processPreview/);
+assert.match(app, /normalizeTraceSettings/);
 console.log("release core tests passed");

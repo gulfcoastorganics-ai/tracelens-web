@@ -1,6 +1,10 @@
 import { getTraceStage } from "./trace-stages.js";
+import { detailMapping, normalizeTraceSettings } from "./trace-presets.js";
+import { applyTraceMask } from "./trace-analysis.js";
 
 function clamp(value, min = 0, max = 255) { return Math.max(min, Math.min(max, value)); }
+
+function emphasizeCenter(image, strength = .6) { const output = new Uint8ClampedArray(image.data); const cx = image.width / 2; const cy = image.height / 2; const radius = Math.max(1, Math.min(image.width, image.height) * .48); for (let y = 0; y < image.height; y += 1) for (let x = 0; x < image.width; x += 1) { const distance = Math.hypot(x - cx, y - cy) / radius; if (distance <= 1) continue; const factor = Math.max(0, 1 - (distance - 1) * 2) * strength; const index = (y * image.width + x) * 4; const gray = (output[index] * 54 + output[index + 1] * 183 + output[index + 2] * 19) >> 8; output[index] = output[index + 1] = output[index + 2] = output[index] * factor + gray * (1 - factor); } return { ...image, data: output }; }
 
 export function grayscale(image) {
   const output = new Uint8ClampedArray(image.data.length);
@@ -23,7 +27,7 @@ export function blurGray(image, radius = 1) {
 export function sobelEdges(image, threshold = 0.22, invert = false) {
   const source = grayscale(image); const { width, height } = source; const values = new Float32Array(width * height); let max = 1;
   for (let y = 1; y < height - 1; y += 1) for (let x = 1; x < width - 1; x += 1) { const at = (row, col) => source.data[(row * width + col) * 4]; const gx = -at(y - 1, x - 1) + at(y - 1, x + 1) - 2 * at(y, x - 1) + 2 * at(y, x + 1) - at(y + 1, x - 1) + at(y + 1, x + 1); const gy = -at(y - 1, x - 1) - 2 * at(y - 1, x) - at(y - 1, x + 1) + at(y + 1, x - 1) + 2 * at(y + 1, x) + at(y + 1, x + 1); const magnitude = Math.hypot(gx, gy); values[y * width + x] = magnitude; max = Math.max(max, magnitude); }
-  const output = new Uint8ClampedArray(source.data.length); for (let i = 0; i < values.length; i += 1) { const value = values[i] / max >= threshold ? 255 : 0; const visible = invert ? 255 - value : value; const index = i * 4; output[index] = output[index + 1] = output[index + 2] = visible; output[index + 3] = source.data[index + 3]; }
+  const output = new Uint8ClampedArray(source.data.length); for (let i = 0; i < values.length; i += 1) { const value = values[i] / max >= threshold ? 255 : 0; const visible = invert ? 255 - value : value; const index = i * 4; output[index] = output[index + 1] = output[index + 2] = visible; output[index + 3] = value ? source.data[index + 3] : 0; }
   return { data: output, width, height };
 }
 
@@ -40,17 +44,19 @@ export function posterize(image, levels = 5) {
 }
 
 export function composeTrace(image, settings = {}) {
-  const mode = settings.mode || "Original"; if (mode === "Original") return image;
-  const stage = getTraceStage(settings.stage); const contrast = settings.contrast ?? (1.05 + (settings.strength ?? .55) * .35); const blur = (settings.blur ?? 1) + stage.blur; const level = clamp((settings.threshold ?? .48) + stage.thresholdBias, .03, .95); const invert = Boolean(settings.invert || mode === "Inverted Lines");
-  if (mode === "Grayscale") return adjustContrast(grayscale(image), contrast);
-  if (mode === "Posterize") return posterize(adjustContrast(image, contrast), settings.levels || 5);
-  if (mode === "High Contrast") return threshold(adjustContrast(image, contrast), level, invert);
-  if (mode === "Silhouette") return sobelEdges(blurGray(image, blur + 1), Math.max(.24, level), invert);
-  if (mode === "Clean Lines") return sobelEdges(blurGray(image, blur + 1), Math.max(.18, level), invert);
-  if (mode === "Detailed Lines") return sobelEdges(blurGray(image, Math.max(1, blur)), Math.max(.08, level * .7), invert);
-  if (mode === "Inverted Lines") return sobelEdges(blurGray(image, blur + 1), Math.max(.14, level), true);
-  if (mode === "Structure") return sobelEdges(blurGray(image, blur + 2), Math.max(.2, level), invert);
-  return sobelEdges(blurGray(adjustContrast(image, contrast), blur), level, invert);
+  const normalized = normalizeTraceSettings(settings); const mode = normalized.mode; if (mode === "Original") return image;
+  const stage = getTraceStage(normalized.stage); const mapping = detailMapping(normalized); const contrast = normalized.contrast; const blur = normalized.blur + stage.blur + normalized.morphology * .25; const level = clamp(mapping.edgeThreshold + stage.thresholdBias, .03, .95); const invert = Boolean(normalized.invert || mode === "Inverted Lines");
+  const prepared = applyTraceMask(adjustContrast(blurGray((normalized.isolation || normalized.backgroundSuppression > 0) ? emphasizeCenter(image, normalized.isolation ? .8 : normalized.backgroundSuppression) : image, blur), contrast), normalized.mask);
+  if (mode === "Grayscale") return prepared;
+  if (mode === "Posterize" || mode === "Shadow Blocks" || mode === "High-Contrast Stencil") return posterize(prepared, normalized.levels || (mode === "Shadow Blocks" ? 5 : 3));
+  if (mode === "High Contrast") return threshold(prepared, level, invert);
+  const weightBias = normalized.lineWeight === "Structural" ? .08 : normalized.lineWeight === "Expressive" ? -.05 : 0;
+  if (mode === "Silhouette" || mode === "Clean Contour") return sobelEdges(blurGray(prepared, blur + 1), Math.max(.18, level + weightBias), invert);
+  if (mode === "Clean Lines" || mode === "Technical Outline" || mode === "Architecture") return sobelEdges(blurGray(prepared, blur + (mode === "Architecture" ? 1 : 0)), Math.max(.14, level + weightBias), invert);
+  if (mode === "Detailed Lines" || mode === "Pencil Sketch" || mode === "Comic Ink" || mode === "Simplified Portrait") return sobelEdges(blurGray(prepared, Math.max(1, blur)), Math.max(.06, level * .72), invert);
+  if (mode === "Inverted Lines") return sobelEdges(blurGray(prepared, blur + 1), Math.max(.12, level), true);
+  if (mode === "Structure") return sobelEdges(blurGray(prepared, blur + 2), Math.max(.16, level), invert);
+  return sobelEdges(blurGray(prepared, blur), level, invert);
 }
 
 export function imageDataToArray(image) { return { data: new Uint8ClampedArray(image.data), width: image.width, height: image.height }; }
