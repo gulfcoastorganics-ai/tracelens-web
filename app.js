@@ -21,7 +21,10 @@ const layerThumb = document.querySelector("#layerThumb");
 const layerName = document.querySelector("#layerName");
 const layerVisibility = document.querySelector("#layerVisibility");
 const layerLock = document.querySelector("#layerLock");
+const selectionFrame = document.querySelector("#selectionFrame");
 const gestureHint = document.querySelector("#gestureHint");
+const zoomReadout = document.querySelector("#zoomReadout");
+const rotationReadout = document.querySelector("#rotationReadout");
 const opacityOutput = document.querySelector("#opacityOutput");
 const opacityValue = document.querySelector("#opacityValue");
 const scaleOutput = document.querySelector("#scaleOutput");
@@ -30,6 +33,7 @@ const status = document.querySelector("#status");
 
 let x = 0, y = 0, scale = 1, rotation = 0, opacity = 0.55, flipped = false, stream = null;
 let pointers = new Map(), gestureStart = null, dragging = false, pointerStartX = 0, pointerStartY = 0, originX = 0, originY = 0;
+const overlayTools = document.querySelectorAll(".overlay-tool");
 
 function renderOverlay() {
   const flip = flipped ? -1 : 1;
@@ -39,6 +43,8 @@ function renderOverlay() {
   opacityValue.textContent = `${Math.round(opacity * 100)}%`;
   scaleOutput.textContent = `${Math.round(scale * 100)}%`;
   rotationOutput.textContent = `${rotation}°`;
+  zoomReadout.textContent = `Zoom ${scale.toFixed(2)}×`;
+  rotationReadout.textContent = `${rotation}°`;
 }
 
 async function startCamera() {
@@ -64,8 +70,12 @@ function loadImage(file) {
     layerThumb.src = reader.result;
     layerName.textContent = file.name.replace(/\.[^/.]+$/, "");
     overlay.style.display = "block";
+    overlay.hidden = false;
+    layerVisibility.textContent = "◉";
     emptyState.style.display = "none";
     layerCard.hidden = false;
+    selectionFrame.classList.add("visible");
+    overlayTools.forEach(tool => tool.classList.add("available"));
     gestureHint.hidden = false;
     status.textContent = "Overlay loaded. Drag, pinch, or rotate to position it.";
   };
@@ -97,7 +107,7 @@ stage.addEventListener("pointerdown", event => {
 });
 stage.addEventListener("pointermove", event => {
   if (!pointers.has(event.pointerId)) return; pointers.set(event.pointerId, event);
-  if (pointers.size === 2 && gestureStart) { const [a,b] = [...pointers.values()]; scale = Math.max(.25, Math.min(3, gestureStart.scale * distance(a,b) / gestureStart.distance)); rotation = Math.round(gestureStart.rotation + angle(a,b) - gestureStart.angle); scaleInput.value = scale; rotationInput.value = rotation; renderOverlay(); return; }
+  if (pointers.size === 2 && gestureStart) { const [a,b] = [...pointers.values()]; scale = Math.max(.25, Math.min(3, gestureStart.scale * distance(a,b) / gestureStart.distance)); const rawRotation = gestureStart.rotation + angle(a,b) - gestureStart.angle; rotation = Math.round(rawRotation / 15) * 15; scaleInput.value = scale; rotationInput.value = rotation; renderOverlay(); return; }
   if (dragging) { x = originX + event.clientX - pointerStartX; y = originY + event.clientY - pointerStartY; renderOverlay(); }
 });
 function endPointer(event) { pointers.delete(event.pointerId); if (stage.hasPointerCapture(event.pointerId)) stage.releasePointerCapture(event.pointerId); if (pointers.size < 2) gestureStart = null; dragging = pointers.size === 1; }

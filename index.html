@@ -21,6 +21,7 @@
     <section class="stage" id="stage" aria-label="Camera canvas">
       <video id="camera" autoplay playsinline muted></video>
       <img id="overlay" alt="Reference overlay" />
+      <div class="selection-frame" id="selectionFrame" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
       <div class="grid" id="grid"></div>
       <div class="reticle" aria-hidden="true"><i></i><i></i><i></i><i></i><span></span></div>
 
@@ -47,6 +48,8 @@
       </div>
 
       <div class="gesture-hint" id="gestureHint">Drag to position · Pinch to scale</div>
+      <div class="canvas-readout canvas-readout-left" id="zoomReadout">Zoom 1.00×</div>
+      <div class="canvas-readout canvas-readout-right" id="rotationReadout">0°</div>
     </section>
 
     <section class="control-area">
@@ -59,10 +62,10 @@
 
       <nav class="dock" aria-label="TraceLens tools">
         <label class="dock-button import-tool" aria-label="Import image"><span class="tool-icon">＋</span><span>Import</span><input id="dockImageInput" type="file" accept="image/*" /></label>
-        <button class="dock-button" id="gridButton"><span class="tool-icon">⊞</span><span>Grid</span></button>
-        <button class="dock-button" id="flipButton"><span class="tool-icon">⇆</span><span>Flip</span></button>
-        <button class="dock-button" id="adjustButton"><span class="tool-icon">☷</span><span>Adjust</span></button>
-        <button class="dock-button" id="resetButton"><span class="tool-icon">↺</span><span>Reset</span></button>
+        <button class="dock-button overlay-tool" id="gridButton"><span class="tool-icon">⊞</span><span>Grid</span></button>
+        <button class="dock-button overlay-tool" id="flipButton"><span class="tool-icon">⇆</span><span>Flip</span></button>
+        <button class="dock-button overlay-tool" id="adjustButton"><span class="tool-icon">☷</span><span>Adjust</span></button>
+        <button class="dock-button overlay-tool" id="resetButton"><span class="tool-icon">↺</span><span>Reset</span></button>
       </nav>
     </section>
 
