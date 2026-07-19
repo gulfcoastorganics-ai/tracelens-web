@@ -17,18 +17,18 @@ export class SurfaceTracker {
   getLockCandidate() { return this.stableSampleCount >= this.stableSamplesRequired ? this.stableResult : null; }
 
   handleResult(result) {
-    const now = performance.now(); const validation = result.quad ? validateQuad(result.quad) : { valid: false, metrics: { reason: result.rejection || "no-quad" } }; const valid = Boolean(result.found && validation.valid); const motion = valid ? cornerMotion(this.previousCandidate, result.quad) : 0;
+    const now = performance.now(); const validation = result.quad ? validateQuad(result.quad) : { valid: false, metrics: { reason: result.rejection || "no-quad" } }; const valid = Boolean(result.found && validation.valid); const motion = valid ? cornerMotion(this.previousCandidate, result.quad) : 0; let rejection = valid ? null : (result.rejection || validation.metrics.reason);
     if (valid) {
       this.lastResult = { ...result, metrics: validation.metrics, cornerMotion: motion };
       if (!this.smoothedQuad) this.smoothedQuad = result.quad.map(point => ({ ...point })); else result.quad.forEach((point, index) => { this.smoothedQuad[index].x += (point.x - this.smoothedQuad[index].x) * 0.22; this.smoothedQuad[index].y += (point.y - this.smoothedQuad[index].y) * 0.22; });
       if (this.scanning) {
         const inWindow = now - this.scanStartedAt <= this.stableWindowMs;
-        if (!inWindow || motion > this.maxCornerMotion) { this.stableSampleCount = 1; this.scanStartedAt = now; } else this.stableSampleCount += 1;
+        if (!inWindow || motion > this.maxCornerMotion) { this.stableSampleCount = 1; this.scanStartedAt = now; if (motion > this.maxCornerMotion) rejection = "corner-motion-too-high"; } else this.stableSampleCount += 1;
         this.previousCandidate = result.quad.map(point => ({ ...point }));
         if (this.stableSampleCount >= this.stableSamplesRequired) this.stableResult = { ...result, quad: this.smoothedQuad.map(point => ({ ...point })), metrics: validation.metrics, cornerMotion: motion };
       }
     } else if (this.scanning) { this.stableSampleCount = 0; this.stableResult = null; this.previousCandidate = null; }
     const status = this.state.update(valid ? result.confidence : 0, now, this.locked);
-    this.onUpdate?.({ ...result, ...status, found: valid, quad: this.smoothedQuad, metrics: valid ? validation.metrics : (result.metrics || validation.metrics), cornerMotion: motion, stableSampleCount: this.stableSampleCount, stableSamplesRequired: this.stableSamplesRequired, lockEligible: Boolean(this.stableResult), scanning: this.scanning, locked: this.locked, rejection: valid ? null : (result.rejection || validation.metrics.reason) });
+    this.onUpdate?.({ ...result, ...status, found: valid, quad: this.smoothedQuad, metrics: valid ? validation.metrics : (result.metrics || validation.metrics), cornerMotion: motion, stableSampleCount: this.stableSampleCount, stableSamplesRequired: this.stableSamplesRequired, lockEligible: Boolean(this.stableResult), scanning: this.scanning, locked: this.locked, rejection });
   }
 }
