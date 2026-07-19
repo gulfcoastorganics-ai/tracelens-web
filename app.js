@@ -98,7 +98,7 @@ const surfaceTracker = new SurfaceTracker({ onUpdate: result => {
     selectionFrame.classList.add("surface-found"); selectionFrame.style.clipPath = `polygon(${result.quad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`;
     if (perspectiveActive && !locks.perspective) { activePerspectiveQuad = result.quad.map(point => ({ ...point })); snapController.snap(workspaceImage, perspectiveSolver.toPixels(result.quad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); }
   } else if (result.state === "lost") selectionFrame.classList.remove("surface-found");
-});
+}});
 
 function renderOverlay() {
   const flip = flipped ? -1 : 1;
@@ -221,8 +221,8 @@ function loadImage(file) {
   reader.readAsDataURL(file);
 }
 
-imageInput.addEventListener("change", event => loadImage(event.target.files?.[0]));
-dockImageInput.addEventListener("change", event => loadImage(event.target.files?.[0]));
+imageInput?.addEventListener("change", event => loadImage(event.target.files?.[0]));
+dockImageInput?.addEventListener("change", event => loadImage(event.target.files?.[0]));
 opacityInput.addEventListener("input", event => { opacity = Number(event.target.value); renderOverlay(); });
 scaleInput.addEventListener("input", event => { if (!locks.canEdit("scale")) return; scale = Number(event.target.value); renderOverlay(); });
 rotationInput.addEventListener("input", event => { if (!locks.canEdit("rotation")) return; rotation = Number(event.target.value); renderOverlay(); });
@@ -291,7 +291,44 @@ stage.addEventListener("pointermove", event => {
 function endPointer(event) { perspectiveDragIndex = null; pointers.delete(event.pointerId); if (stage.hasPointerCapture(event.pointerId)) stage.releasePointerCapture(event.pointerId); if (pointers.size < 2) gestureStart = null; dragging = pointers.size === 1; }
 stage.addEventListener("pointerup", endPointer); stage.addEventListener("pointercancel", endPointer);
 function requestVisionFrame(now = performance.now()) { diagnostics.frame(); adaptiveOpacity.update(camera, now); diagnostics.render({ tracking: surfaceTracker.state.confidence, camera: camera.videoWidth ? `${camera.videoWidth}×${camera.videoHeight}` : "—", quality: perspectiveActive ? "perspective" : "high" }); requestAnimationFrame(requestVisionFrame); }
-profileInput.replaceChildren(...calibrationProfiles.names().map(name => new Option(name, name)));
-applyPreset(presetInput.value, false);
-refreshProjectList();
-gestureHint.hidden = true; renderOverlay(); startCamera(); restoreWorkspace(); restoreLatestProject(); requestVisionFrame();
+
+function initializeCoreUI() {
+  const required = { stage, camera, cameraState, status, imageInput, dockImageInput, cameraButton };
+  const missing = Object.entries(required).filter(([, element]) => !element).map(([name]) => name);
+  if (missing.length) throw new Error(`TraceLens core UI missing: ${missing.join(", ")}`);
+  gestureHint.hidden = true;
+  renderOverlay();
+}
+
+function initializeCamera() {
+  startCamera().catch(error => { cameraState.textContent = "CAMERA UNAVAILABLE"; status.textContent = "Camera could not start. Check HTTPS and permission."; console.error("[TraceLens camera] startup failed", error); });
+}
+
+function initializeImageImport() {
+  if (!imageInput || !dockImageInput) throw new Error("TraceLens image import controls are missing.");
+  console.info("[TraceLens core] image import handlers ready");
+}
+
+function initializeOptionalSystems() {
+  try {
+    profileInput.replaceChildren(...calibrationProfiles.names().map(name => new Option(name, name)));
+    applyPreset(presetInput.value, false);
+    refreshProjectList();
+    restoreWorkspace();
+    restoreLatestProject();
+  } catch (error) {
+    console.error("[TraceLens optional] initialization failed; core camera/import remain active", error);
+    status.textContent = "Camera ready. Advanced workspace tools are unavailable.";
+  }
+}
+
+try {
+  initializeCoreUI();
+  initializeImageImport();
+  initializeCamera();
+  initializeOptionalSystems();
+  requestVisionFrame();
+} catch (error) {
+  console.error("[TraceLens core] initialization failed", error);
+  if (status) status.textContent = "TraceLens could not initialize. Refresh and try again.";
+}
