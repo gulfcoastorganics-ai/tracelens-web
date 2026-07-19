@@ -1,4 +1,5 @@
 import { VisionUtils } from "./vision-utils.js";
+import { validateQuad } from "./quad-geometry.js";
 
 export class SurfaceDetector {
   constructor({ interval = 200, onUpdate } = {}) {
@@ -31,7 +32,7 @@ export class SurfaceDetector {
   };
 
   detect() {
-    if (!this.video?.videoWidth || this.video.readyState < 2) return null;
+    if (!this.video?.videoWidth || this.video.readyState < 2) return { found: false, confidence: 0, rejection: "camera-not-ready" };
     const canvas = this.vision.canvas;
     const context = this.vision.context;
     const { width, height } = canvas;
@@ -53,7 +54,7 @@ export class SurfaceDetector {
     }
     const area = Math.max(0, right - left) * Math.max(0, bottom - top);
     const frameArea = width * height;
-    if (edges < 18 || area < frameArea * 0.12) return { found: false, confidence: 0 };
+    if (edges < 18 || area < frameArea * 0.12) return { found: false, confidence: 0, rejection: edges < 18 ? "insufficient-edges" : "area-too-small" };
     const inset = 2;
     const quad = [
       { x: (left + inset) / width, y: (top + inset) / height },
@@ -61,7 +62,9 @@ export class SurfaceDetector {
       { x: (right - inset) / width, y: (bottom - inset) / height },
       { x: (left + inset) / width, y: (bottom - inset) / height }
     ];
-    const confidence = Math.round(Math.min(0.98, 0.45 + (area / frameArea) * 0.35 + Math.min(0.2, edges / 500)) * 100);
-    return { found: true, type: "planar surface", confidence, quad, timestamp: performance.now() };
+    const validation = validateQuad(quad);
+    const rawConfidence = Math.round(Math.min(0.98, 0.45 + (area / frameArea) * 0.35 + Math.min(0.2, edges / 500)) * 100);
+    if (!validation.valid) return { found: false, confidence: rawConfidence, rawConfidence, quad, metrics: validation.metrics, rejection: validation.metrics.reason, timestamp: performance.now() };
+    return { found: true, type: "rectangular surface", confidence: rawConfidence, rawConfidence, quad, metrics: validation.metrics, timestamp: performance.now() };
   }
 }

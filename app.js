@@ -12,6 +12,7 @@ import { getWorkflowPreset } from "./workflow-presets.js";
 import { createProjectBundle, validateProjectBundle, downloadProjectBundle } from "./project-bundles.js";
 import { CalibrationProfiles } from "./calibration-profiles.js";
 import { SessionTimeline } from "./session-timeline.js";
+import { PerspectiveSession } from "./perspective-session.js";
 import { CALIBRATION_REFERENCES, calculateCalibration, fromMillimeters } from "./physical-calibration.js";
 import { GestureCoach } from "./onboarding.js";
 import { registerPWA } from "./pwa.js";
@@ -38,6 +39,7 @@ const workspaceButton = document.querySelector("#workspaceButton");
 const closeAdjust = document.querySelector("#closeAdjust");
 const adjustSheet = document.querySelector("#adjustSheet");
 const autoPerspectiveButton = document.querySelector("#autoPerspectiveButton");
+const manualPerspectiveButton = document.querySelector("#manualPerspectiveButton");
 const autoOpacityInput = document.querySelector("#autoOpacityInput");
 const visionStatus = document.querySelector("#visionStatus");
 const blendModeInput = document.querySelector("#blendModeInput");
@@ -101,6 +103,8 @@ let gestureFrame = 0;
 let physicalCalibration = null;
 let lastTapAt = 0;
 let longPressTimer = null;
+let autoPerspectiveScanning = false;
+let latestSurfaceDiagnostics = {};
 const vision = new VisionUtils();
 const perspectiveSolver = new PerspectiveSolver();
 const snapController = new OverlaySnapController(perspectiveOverlay);
@@ -115,13 +119,23 @@ const gestureCoach = new GestureCoach(gestureCoachElement, { reducedMotion: type
 const adaptiveOpacity = new AdaptiveOpacityController({ analyzer: vision, onOpacity: (value, metrics) => { opacity = value; opacityInput.value = value; renderOverlay(); perspectiveOverlay.style.opacity = value; } });
 const surfaceTracker = new SurfaceTracker({ onUpdate: result => {
   if (!workspaceImage) return;
-  const stateLabel = result.state === "tracking" ? "Stable" : result.state === "weak" ? "Weak" : result.state === "lost" ? "Lost · Hold device steady" : "Searching";
-  visionStatus.textContent = `${result.state === "tracking" ? "Tracking" : stateLabel} · ${result.confidence}% · ${stateLabel}`;
+  latestSurfaceDiagnostics = { rawConfidence: result.rawConfidence ?? result.confidence, stable: `${result.stableSampleCount}/${result.stableSamplesRequired}`, area: ((result.metrics?.area || 0) * 100).toFixed(1), aspect: (result.metrics?.aspectRatio || 0).toFixed(2), motion: (result.cornerMotion || 0).toFixed(3), rejection: result.rejection || "—" };
+  const stateLabel = result.state === "tracking" ? "Tracking" : result.state === "weak" ? "Tracking weak" : result.state === "lost" ? "Tracking lost" : "Scanning";
+  visionStatus.textContent = result.scanning && result.lockEligible ? `Surface stable · ${result.stableSampleCount}/${result.stableSamplesRequired}` : `${stateLabel} · ${result.confidence}%`;
   if (result.found && result.quad) {
     selectionFrame.classList.add("surface-found"); selectionFrame.style.clipPath = `polygon(${result.quad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`;
-    if (perspectiveActive && !locks.perspective) { activePerspectiveQuad = result.quad.map(point => ({ ...point })); snapController.snap(workspaceImage, perspectiveSolver.toPixels(result.quad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); }
+    if (result.scanning && result.lockEligible && autoPerspectiveScanning) { perspectiveSession.updateCandidate(result); if (confirmPerspectiveLock()) return; }
+    if (perspectiveActive && surfaceTracker.locked && result.found) { activePerspectiveQuad = result.quad.map(point => ({ ...point })); snapController.snap(workspaceImage, perspectiveSolver.toPixels(result.quad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); }
   } else if (result.state === "lost") selectionFrame.classList.remove("surface-found");
 }});
+const perspectiveSession = new PerspectiveSession(surfaceTracker.stableSamplesRequired);
+
+function confirmPerspectiveLock() {
+  const candidate = perspectiveSession.candidate || surfaceTracker.getLockCandidate();
+  if (!candidate || !perspectiveSession.confirm() || !surfaceTracker.lock()) return false;
+  autoPerspectiveScanning = false; autoPerspectiveButton.classList.remove("active"); activePerspectiveQuad = candidate.quad.map(point => ({ ...point })); perspectiveActive = true;
+  snapController.snap(workspaceImage, perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); overlay.style.display = "none"; selectionFrame.classList.add("surface-found"); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; status.textContent = "Perspective locked."; visionStatus.textContent = "Perspective locked · Tracking"; addTimeline("Perspective Locked"); return true;
+}
 
 function renderOverlay() {
   const flip = flipped ? -1 : 1;
@@ -155,7 +169,7 @@ function applyProject(project) {
   if (project.preset) { presetInput.value = project.preset; applyPreset(project.preset, false); } applyState(project); applyLocks(project.locks); pushHistory(); surfaceTracker.start(camera);
 }
 async function refreshProjectList() { try { let projects = await projectLibrary.all(); const query = projectSearchInput.value.trim().toLowerCase(); if (query) projects = projects.filter(project => project.name.toLowerCase().includes(query) || (project.preset || "").toLowerCase().includes(query)); const sort = projectSortInput.value; projects.sort((a, b) => sort === "name" ? a.name.localeCompare(b.name) : sort === "created" ? b.createdAt - a.createdAt : sort === "favorite" ? Number(b.favorite) - Number(a.favorite) || b.updatedAt - a.updatedAt : b.updatedAt - a.updatedAt); projectList.replaceChildren(new Option(projects.length ? "Projects" : "No projects yet", ""), ...projects.map(project => new Option(`${project.favorite ? "★ " : ""}${project.name} · ${new Date(project.updatedAt).toLocaleDateString()}`, project.id))); } catch (error) { console.error("[TraceLens projects] list failed", error); status.textContent = "Project storage is unavailable."; } }
-function applyPreset(name, announce = true) { const preset = getWorkflowPreset(name); opacity = preset.opacity; opacityInput.value = opacity; blendModeInput.value = preset.blendMode; guideInput.value = preset.guide; guides.setMode(preset.guide); grid.style.backgroundSize = `${100 / preset.gridSpacing}% ${100 / preset.gridSpacing}%`; surfaceTracker.state.weakAt = preset.tracking.weakAt; surfaceTracker.state.lostAt = preset.tracking.lostAt; renderOverlay(); if (announce) { status.textContent = `${name} workspace active.`; addTimeline("Preset", name); } }
+function applyPreset(name, announce = true) { const preset = getWorkflowPreset(name); opacity = preset.opacity; opacityInput.value = opacity; blendModeInput.value = preset.blendMode; guideInput.value = preset.guide; guides.setMode(preset.guide); grid.style.backgroundSize = `${100 / preset.gridSpacing}% ${100 / preset.gridSpacing}%`; surfaceTracker.state.retainAt = preset.tracking.weakAt; surfaceTracker.state.acquireAt = Math.max(72, preset.tracking.weakAt + 12); surfaceTracker.state.lostAt = preset.tracking.lostAt; renderOverlay(); if (announce) { status.textContent = `${name} workspace active.`; addTimeline("Preset", name); } }
 function applyPhysicalCalibration() {
   const reference = CALIBRATION_REFERENCES[calibrationReference.value];
   const desired = Number(calibrationWidth.value);
@@ -187,7 +201,7 @@ async function saveProject() {
   if (!workspaceImage) { status.textContent = "Import an image before saving a project."; return; }
   const name = projectNameInput.value.trim() || "Untitled project";
   currentProjectId ||= globalThis.crypto?.randomUUID?.() || `project-${Date.now()}`;
-  await projectLibrary.put({ id: currentProjectId, name, image: workspaceImage, preset: presetInput.value, perspective: activePerspectiveQuad, ...captureState(), locks: { ...locks }, updatedAt: Date.now(), thumbnail: await projectLibrary.thumbnail(workspaceImage) });
+  await projectLibrary.put({ id: currentProjectId, name, image: workspaceImage, preset: presetInput.value, perspective: surfaceTracker.locked ? activePerspectiveQuad : null, perspectiveLocked: surfaceTracker.locked, ...captureState(), locks: { ...locks }, updatedAt: Date.now(), thumbnail: await projectLibrary.thumbnail(workspaceImage) });
   await refreshProjectList(); addTimeline("Saved", name);
   status.textContent = `Project “${name}” saved.`;
 }
@@ -238,6 +252,7 @@ function loadImage(file) {
   reader.onload = () => {
     snapController.clear();
     perspectiveActive = false;
+    surfaceTracker.unlock(); surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; autoPerspectiveButton.classList.remove("active");
     overlay.src = reader.result;
     workspaceImage = reader.result;
     layerThumb.src = reader.result;
@@ -293,13 +308,11 @@ diagnosticsInput.addEventListener("change", event => { diagnosticsOutput.hidden 
 document.querySelectorAll("[data-lock]").forEach(input => input.addEventListener("change", event => { locks.toggle(event.target.dataset.lock); status.textContent = `${event.target.dataset.lock} ${event.target.checked ? "locked" : "unlocked"}.`; }));
 autoOpacityInput.addEventListener("change", event => { adaptiveOpacity.setEnabled(event.target.checked); if (event.target.checked) status.textContent = "Auto Opacity active."; });
 autoPerspectiveButton.addEventListener("click", () => {
-  autoPerspectiveButton.classList.add("active");
-  const result = surfaceTracker.lastResult;
-  if (!result?.found || !workspaceImage) { visionStatus.textContent = "Scanning Surface..."; surfaceTracker.start(camera); return; }
-  const quad = perspectiveSolver.toPixels(result.quad, stage.clientWidth, stage.clientHeight);
-  snapController.snap(workspaceImage, quad, stage.clientWidth, stage.clientHeight, opacity);
-  activePerspectiveQuad = result.quad.map(point => ({ ...point })); perspectiveActive = true; surfaceTracker.lock(); overlay.style.display = "none"; selectionFrame.classList.add("surface-found"); selectionFrame.style.clipPath = `polygon(${result.quad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; status.textContent = "Perspective Locked."; visionStatus.textContent = `Tracking · ${result.confidence}% · Stable`; addTimeline("Perspective Locked");
+  if (perspectiveActive && surfaceTracker.locked) { snapController.clear(); perspectiveActive = false; activePerspectiveQuad = null; surfaceTracker.unlock(); perspectiveSession.unlock(); autoPerspectiveScanning = false; autoPerspectiveButton.classList.remove("active"); overlay.style.display = "block"; selectionFrame.style.clipPath = "none"; status.textContent = "Manual mode."; visionStatus.textContent = "Manual mode"; return; }
+  if (autoPerspectiveScanning) { surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; autoPerspectiveButton.classList.remove("active"); visionStatus.textContent = "Manual mode"; status.textContent = "Surface scan cancelled."; return; }
+  autoPerspectiveScanning = true; surfaceTracker.beginScan(); perspectiveSession.beginScan(); surfaceTracker.start(camera); autoPerspectiveButton.classList.add("active"); visionStatus.textContent = "Scanning · Hold steady"; status.textContent = "Scanning surface. Hold steady.";
 });
+manualPerspectiveButton.addEventListener("click", () => { surfaceTracker.unlock(); surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; activePerspectiveQuad = [{ x: .08, y: .08 }, { x: .92, y: .08 }, { x: .92, y: .92 }, { x: .08, y: .92 }]; perspectiveActive = true; autoPerspectiveButton.classList.remove("active"); overlay.style.display = "none"; snapController.snap(workspaceImage, perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; status.textContent = "Manual mode · adjust corners."; visionStatus.textContent = "Manual mode"; });
 layerVisibility.addEventListener("click", () => { overlay.hidden = !overlay.hidden; layerVisibility.textContent = overlay.hidden ? "⊘" : "◉"; });
 layerLock.addEventListener("click", () => { locks.toggle("position"); stage.classList.toggle("locked", locks.position); layerLock.textContent = locks.position ? "♙" : "♧"; });
 resetButton.addEventListener("click", () => { x = 0; y = 0; scale = 1; rotation = 0; opacity = 0.55; flipped = false; opacityInput.value = opacity; scaleInput.value = scale; rotationInput.value = rotation; renderOverlay(); flipButton.classList.remove("active"); status.textContent = "Overlay position reset."; });
@@ -328,7 +341,7 @@ stage.addEventListener("pointerdown", event => {
   const handle = event.target.closest?.(".selection-frame i");
   if (perspectiveActive && handle && locks.canEdit("perspective")) { perspectiveDragIndex = [...selectionFrame.querySelectorAll("i")].indexOf(handle); stage.setPointerCapture(event.pointerId); return; }
   if (!locks.canEdit("position")) return;
-  if (perspectiveActive && locks.canEdit("perspective")) { snapController.clear(); perspectiveActive = false; surfaceTracker.unlock(); overlay.style.display = "block"; autoPerspectiveButton.classList.remove("active"); selectionFrame.classList.remove("surface-found"); selectionFrame.style.clipPath = "none"; status.textContent = "Manual alignment resumed."; }
+  if (perspectiveActive && locks.canEdit("perspective")) { snapController.clear(); perspectiveActive = false; surfaceTracker.unlock(); perspectiveSession.cancel(); overlay.style.display = "block"; autoPerspectiveButton.classList.remove("active"); selectionFrame.classList.remove("surface-found"); selectionFrame.style.clipPath = "none"; status.textContent = "Manual alignment resumed."; }
   pointers.set(event.pointerId, event); stage.setPointerCapture(event.pointerId);
   if (pointers.size === 1) { dragging = true; pointerStartX = event.clientX; pointerStartY = event.clientY; originX = x; originY = y; }
   if (pointers.size === 2) { dragging = false; const [a, b] = [...pointers.values()]; gestureStart = { distance: distance(a,b), angle: angle(a,b), scale, rotation }; }
@@ -346,7 +359,7 @@ stage.addEventListener("pointercancel", () => { window.clearTimeout(longPressTim
 window.addEventListener("blur", () => { window.clearTimeout(longPressTimer); pointers.clear(); gestureStart = null; dragging = false; });
 document.addEventListener("visibilitychange", () => { if (document.hidden) { surfaceTracker.stop(); } else if (camera.srcObject && workspaceImage) surfaceTracker.start(camera); });
 window.addEventListener("keydown", event => { if (event.key === "Escape" && adjustSheet.classList.contains("open")) { closeAdjust.click(); } });
-function requestVisionFrame(now = performance.now()) { diagnostics.frame(); if (workspaceImage && !document.hidden) adaptiveOpacity.update(camera, now); diagnostics.render({ tracking: surfaceTracker.state.confidence, camera: camera.videoWidth ? `${camera.videoWidth}×${camera.videoHeight}` : "—", quality: perspectiveActive ? "perspective" : "high" }); requestAnimationFrame(requestVisionFrame); }
+function requestVisionFrame(now = performance.now()) { diagnostics.frame(); if (workspaceImage && !document.hidden) adaptiveOpacity.update(camera, now); diagnostics.render({ tracking: surfaceTracker.state.confidence, camera: camera.videoWidth ? `${camera.videoWidth}×${camera.videoHeight}` : "—", quality: perspectiveActive ? "perspective" : "high", ...latestSurfaceDiagnostics }); requestAnimationFrame(requestVisionFrame); }
 
 function initializeCoreUI() {
   const required = { stage, camera, cameraState, status, imageInput, dockImageInput, cameraButton };
