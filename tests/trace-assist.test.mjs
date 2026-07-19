@@ -7,6 +7,7 @@ import { TRACE_MODES, normalizeTraceSettings, detailMapping } from "../trace-pre
 import { rankTraceLines, applyLinePriority, scoreTraceQuality, generateValueZones, generateTraceStages, applyTraceMask } from "../trace-analysis.js";
 import { normalizeTraceMask, addMaskStroke } from "../trace-masks.js";
 import { TraceEngine, resultToDataUrl } from "../trace-engine.js";
+import { getWorkflowPreset } from "../workflow-presets.js";
 
 function fixture(width = 9, height = 9) { const data = new Uint8ClampedArray(width * height * 4); for (let i = 0; i < data.length; i += 4) data[i] = data[i + 1] = data[i + 2] = 20; for (let y = 2; y < 7; y += 1) for (let x = 2; x < 7; x += 1) { const i = (y * width + x) * 4; data[i] = data[i + 1] = data[i + 2] = 240; data[i + 3] = 255; } for (let i = 3; i < data.length; i += 4) data[i] = 255; return { data, width, height }; }
 function synthetic(width, height, pixel) { const data = new Uint8ClampedArray(width * height * 4); for (let y = 0; y < height; y += 1) for (let x = 0; x < width; x += 1) { const value = Math.max(0, Math.min(255, pixel(x, y))); const index = (y * width + x) * 4; data[index] = data[index + 1] = data[index + 2] = value; data[index + 3] = 255; } return { data, width, height }; }
@@ -34,6 +35,7 @@ assert.ok(["Clean Contour", "Pencil Sketch", "Technical Outline", "Shadow Blocks
 const normalized = normalizeTraceSettings({ mode: "unknown", detail: 2, levels: 99 }); assert.equal(normalized.mode, "Clean Lines"); assert.equal(normalized.detail, 1); assert.equal(normalized.levels, 8); assert.ok(detailMapping({ mode: "Pencil Sketch", detail: .2 }).minimumComponent > detailMapping({ mode: "Pencil Sketch", detail: .9 }).minimumComponent);
 assert.equal(normalizeTraceSettings({ mode: "High Contrast" }).mode, "High Contrast"); assert.equal(normalizeTraceSettings({ mode: "Structure" }).mode, "Structure");
 assert.equal(normalizeTraceSettings({ mode: "Pencil Sketch" }).lineWeight, "Structural"); assert.ok(normalizeTraceSettings({ mode: "Pencil Sketch" }).blur >= 2);
+assert.ok(getWorkflowPreset("Artist").description.length > 0); assert.ok(getWorkflowPreset("Tattoo").description.toLowerCase().includes("contrast")); assert.ok(getWorkflowPreset("Blueprint").description.toLowerCase().includes("structural"));
 const ranked = rankTraceLines(contours, { width: input.width, height: input.height, priority: .2 }); assert.ok(ranked.length >= 1); const quality = scoreTraceQuality(edges, contours); assert.ok(quality.score >= 0 && quality.score <= 100); assert.ok(Array.isArray(quality.warnings));
 assert.ok(applyLinePriority(edges, ranked).data.some((value, index) => index % 4 === 3 && value === 0));
 const zones = generateValueZones(input, 5); assert.equal(zones.levels, 5); assert.ok(Math.max(...zones.data) < 5); const stages = generateTraceStages(input, contours); assert.equal(stages.length, 5); assert.ok(stages[0].components.length <= stages[4].components.length);

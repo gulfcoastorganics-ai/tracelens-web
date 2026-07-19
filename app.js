@@ -29,12 +29,19 @@ import { HandTracker } from "./hand-tracker.js";
 import { TraceGuideRenderer } from "./trace-guide-renderer.js";
 import { TraceGuideController } from "./trace-guide.js";
 import { normalizeGuideState } from "./trace-guide-state.js";
+import { AppStateMachine } from "./app-state-machine.js";
+import { normalizeFeatureFlags } from "./feature-flags.js";
+import { createGuidedState, completeStep, setStep } from "./guided-tracing.js";
+import { compareImageData, comparisonSummary } from "./comparison.js";
+import { addRegion, activeRegion, completeRegion, createRegionState, removeRegion, setActiveRegion } from "./regions.js";
+import { createSessionState, pauseSession, recordSessionEvent, resumeSession, sessionDuration, startSession, stopSession, milestones, replayAt } from "./session-replay.js";
 
 const camera = document.querySelector("#camera");
 const overlay = document.querySelector("#overlay");
 const perspectiveOverlay = document.querySelector("#perspectiveOverlay");
 const measurementGuides = document.querySelector("#measurementGuides");
 const stage = document.querySelector("#stage");
+const freezeFrame = document.querySelector("#freezeFrame");
 const imageInput = document.querySelector("#imageInput");
 const dockImageInput = document.querySelector("#dockImageInput");
 const opacityInput = document.querySelector("#opacityInput");
@@ -42,6 +49,12 @@ const scaleInput = document.querySelector("#scaleInput");
 const rotationInput = document.querySelector("#rotationInput");
 const cameraButton = document.querySelector("#cameraButton");
 const cameraFacingButton = document.querySelector("#cameraFacingButton");
+const freezeCameraButton = document.querySelector("#freezeCameraButton");
+const captureDrawingButton = document.querySelector("#captureDrawingButton");
+const compareDrawingButton = document.querySelector("#compareDrawingButton");
+const comparisonOverlay = document.querySelector("#comparisonOverlay");
+const comparisonStatus = document.querySelector("#comparisonStatus");
+const regionOverlay = document.querySelector("#regionOverlay");
 const cameraState = document.querySelector("#cameraState");
 const gridButton = document.querySelector("#gridButton");
 const flipButton = document.querySelector("#flipButton");
@@ -50,6 +63,7 @@ const adjustButton = document.querySelector("#adjustButton");
 const compareButton = document.querySelector("#compareButton");
 const workspaceButton = document.querySelector("#workspaceButton");
 const closeAdjust = document.querySelector("#closeAdjust");
+const sheetHandle = document.querySelector("#sheetHandle");
 const adjustSheet = document.querySelector("#adjustSheet");
 const autoPerspectiveButton = document.querySelector("#autoPerspectiveButton");
 const manualPerspectiveButton = document.querySelector("#manualPerspectiveButton");
@@ -151,11 +165,20 @@ const quickTraceModeButton = document.querySelector("#quickTraceModeButton");
 const quickTraceExpandButton = document.querySelector("#quickTraceExpandButton");
 const adjustTitle = document.querySelector("#adjustTitle");
 const presetChips = document.querySelector("#presetChips");
+const presetDescription = document.querySelector("#presetDescription");
 const status = document.querySelector("#status");
 const updateAction = document.querySelector("#updateAction");
 let pendingPWAUpdate = null;
+const featureFlags = normalizeFeatureFlags();
+const appStateMachine = new AppStateMachine({ onInvalid: event => console.warn("[TraceLens state] invalid transition", event.from, event.to) });
+function transitionAppState(next, reason = "") { return appStateMachine.tryTransition(next, { reason }); }
 
 let x = 0, y = 0, scale = 1, rotation = 0, opacity = 0.55, flipped = false, stream = null;
+let freezeCamera = false;
+let finishedDrawingImage = null;
+let comparisonActive = false;
+let sessionReplay = createSessionState();
+let replayCursorMs = 0;
 let pointers = new Map(), gestureStart = null, dragging = false, pointerStartX = 0, pointerStartY = 0, originX = 0, originY = 0;
 const overlayTools = document.querySelectorAll(".overlay-tool");
 const WORKSPACE_KEY = "tracelens-workspace-v1";
@@ -190,6 +213,7 @@ let listenersBound = false;
 let overlayEmphasisInput = null;
 let overlayEmphasisOutput = null;
 let overlayReadabilityButtons = null;
+let guidedPanel = null;
 let historyRestoring = false;
 let traceQueue = null;
 const vision = new VisionUtils();
@@ -227,6 +251,56 @@ function updatePresetChips() {
   presetChips?.querySelectorAll("[data-preset]").forEach(button => button.classList.toggle("active", button.dataset.preset === presetInput?.value));
 }
 
+function updateGuidedUI(layer = activeLayer()) {
+  if (!guidedPanel || !layer) return;
+  const guided = layer.guided = createGuidedState(layer.guided); const step = guided.steps[guided.activeStep];
+  const title = guidedPanel.querySelector("[data-guided-title]"); const detail = guidedPanel.querySelector("[data-guided-detail]"); const progress = guidedPanel.querySelector("[data-guided-progress]"); const complete = guidedPanel.querySelector("[data-guided-complete]");
+  if (title) title.textContent = step ? `${guided.activeStep + 1}/${guided.steps.length} · ${step.title}` : "Guided tracing";
+  if (detail) detail.textContent = step?.description || "Work through the suggested layers at your own pace.";
+  if (progress) progress.textContent = `${Math.round(guided.sessionProgress * 100)}% complete`;
+  if (complete) complete.textContent = step?.completed ? "Completed" : "Mark complete";
+  const auto = guidedPanel.querySelector("[data-guided-auto]"); if (auto) auto.checked = guided.autoAdvance;
+}
+
+function changeGuidedStep(direction) { const layer = activeLayer(); if (!layer) return; const guided = createGuidedState(layer.guided); guided.activeStep = Math.max(0, Math.min(guided.steps.length - 1, guided.activeStep + direction)); layer.guided = guided; updateGuidedUI(layer); pushHistory(); transitionAppState("Tracing", "guided step changed"); }
+
+function renderRegionOverlay() {
+  if (!regionOverlay || !stage) return;
+  const region = activeRegion(activeLayer()?.regions);
+  regionOverlay.width = Math.max(1, stage.clientWidth); regionOverlay.height = Math.max(1, stage.clientHeight);
+  const context = regionOverlay.getContext("2d"); if (!context) return;
+  context.clearRect(0, 0, regionOverlay.width, regionOverlay.height);
+  if (!region || region.visible === false) { regionOverlay.hidden = true; return; }
+  const points = region.points.map(point => ({ x: point.x * regionOverlay.width, y: point.y * regionOverlay.height }));
+  context.save(); context.strokeStyle = region.completed ? "rgba(68,210,122,.72)" : "rgba(93,185,255,.78)"; context.fillStyle = region.completed ? "rgba(68,210,122,.06)" : "rgba(93,185,255,.05)"; context.lineWidth = 1.5; context.setLineDash([6, 5]); context.beginPath();
+  if (region.shape === "rectangle") { const left = Math.min(points[0].x, points[1].x); const top = Math.min(points[0].y, points[1].y); const width = Math.abs(points[1].x - points[0].x); const height = Math.abs(points[1].y - points[0].y); context.rect(left, top, width, height); } else { points.forEach((point, index) => index ? context.lineTo(point.x, point.y) : context.moveTo(point.x, point.y)); context.closePath(); }
+  context.fill(); context.stroke(); context.restore();
+  regionOverlay.hidden = false;
+}
+
+function updateRegionUI(layer = activeLayer()) {
+  const panel = document.querySelector("#regionTracingPanel"); if (!panel) return;
+  const state = createRegionState(layer?.regions); const select = panel.querySelector("[data-region-select]"); const statusOutput = panel.querySelector("[data-region-status]"); const complete = panel.querySelector("[data-region-complete]"); const deleteButton = panel.querySelector("[data-region-delete]");
+  if (select) { select.replaceChildren(new Option(state.regions.length ? "Select region" : "No regions yet", ""), ...state.regions.map(region => new Option(`${region.completed ? "✓ " : ""}${region.name}`, region.id))); select.value = state.activeRegionId || ""; }
+  const current = activeRegion(state); if (statusOutput) statusOutput.textContent = current ? `${current.shape} · ${Math.round(current.progress * 100)}%${current.notes ? ` · ${current.notes}` : ""}` : "Add a region to focus tracing.";
+  if (complete) complete.textContent = current?.completed ? "Restore region" : "Complete region";
+  if (deleteButton) deleteButton.disabled = !current;
+  renderRegionOverlay();
+}
+
+function updateSessionUI() {
+  const panel = document.querySelector("#sessionReplayPanel"); if (!panel) return;
+  const stateOutput = panel.querySelector("[data-session-status]"); const duration = panel.querySelector("[data-session-duration]"); const milestoneOutput = panel.querySelector("[data-session-milestones]"); const start = panel.querySelector("[data-session-start]"); const pause = panel.querySelector("[data-session-pause]"); const stop = panel.querySelector("[data-session-stop]");
+  if (stateOutput) stateOutput.textContent = sessionReplay.status === "recording" ? "Recording" : sessionReplay.status === "paused" ? "Paused" : sessionReplay.status === "stopped" ? "Stopped" : "Ready";
+  if (duration) duration.textContent = `${Math.round(sessionDuration(sessionReplay) / 1000)}s active`;
+  if (milestoneOutput) milestoneOutput.textContent = `${milestones(sessionReplay).length} milestones · ${sessionReplay.events.length} events`;
+  if (start) start.disabled = sessionReplay.status === "recording";
+  if (pause) { pause.disabled = !["recording", "paused"].includes(sessionReplay.status); pause.textContent = sessionReplay.status === "paused" ? "Resume" : "Pause"; }
+  if (stop) stop.disabled = !["recording", "paused"].includes(sessionReplay.status);
+}
+
+function recordSession(type, detail = {}) { sessionReplay = recordSessionEvent(sessionReplay, type, { ...detail, appState: appStateMachine.state }); updateSessionUI(); }
+
 function updateContext() {
   const hasOverlay = Boolean(workspaceImage);
   document.querySelectorAll(".overlay-control").forEach(element => { element.hidden = !hasOverlay; });
@@ -235,7 +309,7 @@ function updateContext() {
   const diagnosticsEnabled = Boolean(diagnosticsInput?.checked);
   if (diagnosticsOutput) diagnosticsOutput.hidden = !diagnosticsEnabled;
   if (quickTraceBar) quickTraceBar.hidden = !hasOverlay;
-  const guideAvailable = Boolean(traceHandTracker?.detector);
+  const guideAvailable = featureFlags.guidedTracing && Boolean(traceHandTracker?.detector);
   if (traceGuideEnabledInput) traceGuideEnabledInput.disabled = !hasOverlay || !guideAvailable;
   if (traceGuidePauseButton) traceGuidePauseButton.disabled = !hasOverlay || !guideAvailable || !traceGuide.state.enabled;
   if (traceGuideNextButton) traceGuideNextButton.disabled = !hasOverlay || !(traceResults.get(activeLayerId)?.lines?.length);
@@ -243,6 +317,7 @@ function updateContext() {
   if (traceGuideStatus && !guideAvailable) traceGuideStatus.textContent = "Requires local hand-landmark model.";
   const traceGuidePanel = document.querySelector("#traceGuidePanel"); if (traceGuidePanel) traceGuidePanel.dataset.unavailable = String(!guideAvailable);
   updatePresetChips();
+  updateRegionUI(); updateSessionUI();
 }
 
 function organizeTraceControls() {
@@ -257,6 +332,17 @@ function organizeTraceControls() {
   overlayReadabilityButtons?.forEach(button => button.addEventListener("click", () => updateReadability(button.dataset.readability)));
   advancedSection.append(labelFor(traceThresholdInput), labelFor(traceBlurInput), labelFor(traceLineWeightInput));
   creative.append(labelFor(traceLevelsInput), labelFor(traceIsolationInput), labelFor(traceBackgroundInput), labelFor(traceStageInput), traceFocusShapeInput?.closest(".trace-focus-row"));
+  const guidedSection = section("Guided tracing"); guidedPanel = document.createElement("div"); guidedPanel.className = "guided-tracing-panel"; guidedPanel.id = "guidedTracingPanel"; guidedPanel.innerHTML = `<div class="guided-tracing-heading"><strong data-guided-title>Guided tracing</strong><span data-guided-progress>0% complete</span></div><p data-guided-detail>Work through the suggested layers at your own pace.</p><div class="guided-tracing-actions"><button type="button" class="feature-button" data-guided-prev aria-label="Previous guided step">Previous</button><button type="button" class="feature-button" data-guided-next aria-label="Next guided step">Next</button><button type="button" class="feature-button" data-guided-complete>Mark complete</button></div><label class="check-control"><input type="checkbox" data-guided-auto /> Auto-advance steps</label>`; guidedSection.append(guidedPanel); guidedPanel.querySelector("[data-guided-prev]")?.addEventListener("click", () => changeGuidedStep(-1)); guidedPanel.querySelector("[data-guided-next]")?.addEventListener("click", () => changeGuidedStep(1)); guidedPanel.querySelector("[data-guided-complete]")?.addEventListener("click", () => { const layer = activeLayer(); if (!layer) return; layer.guided = completeStep(layer.guided); updateGuidedUI(layer); pushHistory(); status.textContent = layer.guided.sessionProgress >= 1 ? "Guided tracing complete." : "Guided step completed."; transitionAppState("Tracing", "guided step completed"); }); guidedPanel.querySelector("[data-guided-auto]")?.addEventListener("change", event => { const layer = activeLayer(); if (!layer) return; layer.guided = createGuidedState({ ...layer.guided, autoAdvance: event.target.checked }); pushHistory(); }); creative.append(guidedSection);
+  const regionSection = section("Trace regions"); const regionPanel = document.createElement("div"); regionPanel.className = "guided-tracing-panel"; regionPanel.id = "regionTracingPanel"; regionPanel.innerHTML = `<div class="guided-tracing-heading"><strong>Trace regions</strong><span data-region-status>Add a region to focus tracing.</span></div><div class="feature-row"><label class="select-control"><span class="sr-only">Active trace region</span><select data-region-select aria-label="Active trace region"><option value="">No regions yet</option></select></label><button type="button" class="feature-button" data-region-add>Add region</button></div><div class="feature-row"><button type="button" class="feature-button" data-region-complete disabled>Complete region</button><button type="button" class="feature-button" data-region-delete disabled>Delete region</button></div>`; regionSection.append(regionPanel); creative.append(regionSection);
+  regionPanel.querySelector("[data-region-add]")?.addEventListener("click", () => { const layer = activeLayer(); if (!layer) return; layer.regions = addRegion(layer.regions, { name: `Region ${layer.regions.regions.length + 1}` }); updateRegionUI(layer); pushHistory(); recordSession("Region created", { regionId: layer.regions.activeRegionId }); status.textContent = "Trace region added."; });
+  regionPanel.querySelector("[data-region-select]")?.addEventListener("change", event => { const layer = activeLayer(); if (!layer) return; layer.regions = setActiveRegion(layer.regions, event.target.value); updateRegionUI(layer); pushHistory(); status.textContent = "Trace region selected."; });
+  regionPanel.querySelector("[data-region-complete]")?.addEventListener("click", () => { const layer = activeLayer(); const current = activeRegion(layer?.regions); if (!layer || !current) return; layer.regions = completeRegion(layer.regions, current.id, !current.completed); updateRegionUI(layer); pushHistory(); recordSession("Region completed", { regionId: current.id }); status.textContent = current.completed ? "Trace region completed." : "Trace region restored."; });
+  regionPanel.querySelector("[data-region-delete]")?.addEventListener("click", () => { const layer = activeLayer(); const current = activeRegion(layer?.regions); if (!layer || !current) return; layer.regions = removeRegion(layer.regions, current.id); updateRegionUI(layer); pushHistory(); recordSession("Region deleted", { regionId: current.id }); status.textContent = "Trace region deleted."; });
+  const sessionSection = section("Session replay"); const sessionPanel = document.createElement("div"); sessionPanel.className = "guided-tracing-panel"; sessionPanel.id = "sessionReplayPanel"; sessionPanel.innerHTML = `<div class="guided-tracing-heading"><strong>Session replay</strong><span data-session-status>Ready</span></div><p><span data-session-duration>0s active</span> · <span data-session-milestones>0 milestones · 0 events</span></p><div class="guided-tracing-actions"><button type="button" class="feature-button" data-session-start>Start</button><button type="button" class="feature-button" data-session-pause disabled>Pause</button><button type="button" class="feature-button" data-session-stop disabled>Stop</button></div><label class="slider"><span>Replay position <output data-session-position>0%</output></span><input data-session-scrub type="range" min="0" max="100" value="0" aria-label="Replay position" /></label>`; sessionSection.append(sessionPanel); diagnosticsSection.append(sessionSection);
+  sessionPanel.querySelector("[data-session-start]")?.addEventListener("click", () => { sessionReplay = startSession(sessionReplay); recordSession("Session started"); updateSessionUI(); });
+  sessionPanel.querySelector("[data-session-pause]")?.addEventListener("click", () => { if (sessionReplay.status === "paused") { sessionReplay = resumeSession(sessionReplay); recordSession("Session resumed"); } else { recordSession("Session paused"); sessionReplay = pauseSession(sessionReplay); } updateSessionUI(); });
+  sessionPanel.querySelector("[data-session-stop]")?.addEventListener("click", () => { sessionReplay = stopSession(sessionReplay); updateSessionUI(); recordSession("Session stopped"); updateSessionUI(); });
+  sessionPanel.querySelector("[data-session-scrub]")?.addEventListener("input", event => { const value = Number(event.target.value) / 100; replayCursorMs = sessionDuration(sessionReplay) * value; const events = replayAt(sessionReplay, replayCursorMs); const position = sessionPanel.querySelector("[data-session-position]"); if (position) position.textContent = `${Math.round(value * 100)}%`; if (timelineOutput) timelineOutput.textContent = events.at(-1) ? `${events.at(-1).type} · replay` : "Session start · replay"; });
   if (traceGuidePanel) { experimental.append(traceGuidePanel); const note = traceGuidePanel.querySelector(".trace-guide-note"); if (note) note.textContent = "Requires local hand-landmark model. Guidance is approximate and does not directly detect a tool tip."; const actions = document.createElement("div"); actions.className = "trace-guide-actions"; actions.innerHTML = `<button type="button" class="feature-button" data-guide-action="learn">Learn more</button><button type="button" class="feature-button" data-guide-action="enable">Enable</button>`; actions.querySelector('[data-guide-action="learn"]')?.addEventListener("click", () => { if (traceGuideStatus) traceGuideStatus.textContent = "Runs locally when a hand-landmark model is installed."; }); actions.querySelector('[data-guide-action="enable"]')?.addEventListener("click", () => { if (!traceHandTracker?.detector) { if (traceGuideStatus) traceGuideStatus.textContent = "Requires local hand-landmark model."; return; } if (traceGuideEnabledInput) { traceGuideEnabledInput.disabled = false; traceGuideEnabledInput.checked = true; traceGuideEnabledInput.dispatchEvent(new Event("change", { bubbles: true })); } }); experimental.append(actions); }
   advanced.replaceChildren(advancedSection, creative, experimental); if (traceQuality) diagnosticsSection.append(traceQuality); panel.append(basic, advanced, diagnosticsSection); panel.dataset.organized = "true";
 }
@@ -274,12 +360,13 @@ function perspectiveFeedback(result = {}) {
 const DEFAULT_TRACE = Object.freeze({ enabled: false, mode: "Original", settings: { strength: .55, detail: .55, priority: .6, threshold: .48, blur: 1, background: "transparent", levels: 5, lineWeight: "Uniform", isolation: false, focusShape: "none", outsideOpacity: 25, assistOpacity: 1, overlayEmphasis: 1, readabilityMode: "blend", mask: { version: 1, strokes: [] } }, stage: 0, contourProgress: {}, stageReveal: "single", guide: { enabled: false, running: false, mode: "finger", tolerance: "Standard", smoothing: "Medium", direction: 1, contourId: null, progressIndex: 0, progress: 0, highestProgress: 0, visited: [], status: "Paused" } });
 function traceState(layer) { layer.trace = { ...DEFAULT_TRACE, ...(layer.trace || {}), mode: TRACE_MODES.includes(layer.trace?.mode) ? layer.trace.mode : "Original", settings: { ...DEFAULT_TRACE.settings, ...(layer.trace?.settings || {}), mask: normalizeTraceMask(layer.trace?.settings?.mask) }, guide: normalizeGuideState(layer.trace?.guide) }; return layer.trace; }
 function applyTraceControls(layer) {
-  const trace = traceState(layer); if (traceModeInput) traceModeInput.value = trace.mode; if (traceStrengthInput) traceStrengthInput.value = trace.settings.strength; if (traceDetailInput) traceDetailInput.value = trace.settings.detail; if (tracePriorityInput) tracePriorityInput.value = trace.settings.priority; if (traceLineWeightInput) traceLineWeightInput.value = trace.settings.lineWeight; if (traceLevelsInput) traceLevelsInput.value = trace.settings.levels; if (traceIsolationInput) traceIsolationInput.checked = trace.settings.isolation; if (traceThresholdInput) traceThresholdInput.value = trace.settings.threshold; if (traceBlurInput) traceBlurInput.value = trace.settings.blur; if (traceBackgroundInput) traceBackgroundInput.value = trace.settings.background; if (traceStageInput) traceStageInput.value = trace.stage ?? 0; if (traceFocusShapeInput) traceFocusShapeInput.value = trace.settings.focusShape || "none"; if (traceOutsideOpacityInput) traceOutsideOpacityInput.value = trace.settings.outsideOpacity ?? 25; if (quickTraceOpacityInput) quickTraceOpacityInput.value = trace.settings.assistOpacity ?? 1; if (overlayEmphasisInput) overlayEmphasisInput.value = trace.settings.overlayEmphasis ?? .5; if (overlayEmphasisOutput) { const emphasis = Number(trace.settings.overlayEmphasis ?? .5); overlayEmphasisOutput.textContent = emphasis < .2 ? "Camera" : emphasis > .8 ? "Overlay" : "Balanced"; } overlayReadabilityButtons?.forEach(button => button.classList.toggle("active", button.dataset.readability === (trace.settings.readabilityMode || "blend"))); if (traceGuideEnabledInput) traceGuideEnabledInput.checked = trace.guide.enabled; if (traceGuideModeInput) traceGuideModeInput.value = trace.guide.mode; if (traceGuideToleranceInput) traceGuideToleranceInput.value = trace.guide.tolerance; if (traceGuideSmoothingInput) traceGuideSmoothingInput.value = trace.guide.smoothing; if (traceGuidePauseButton) traceGuidePauseButton.textContent = trace.guide.running ? "Pause" : "Start"; traceGuide?.setSettings(trace.guide); updateTraceOutputs(); updateFocusWindow(trace); updateTraceQuickUI(layer); if (layerTraceMode) layerTraceMode.textContent = trace.mode;
+  const trace = traceState(layer); if (traceModeInput) traceModeInput.value = trace.mode; if (traceStrengthInput) traceStrengthInput.value = trace.settings.strength; if (traceDetailInput) traceDetailInput.value = trace.settings.detail; if (tracePriorityInput) tracePriorityInput.value = trace.settings.priority; if (traceLineWeightInput) traceLineWeightInput.value = trace.settings.lineWeight; if (traceLevelsInput) traceLevelsInput.value = trace.settings.levels; if (traceIsolationInput) traceIsolationInput.checked = trace.settings.isolation; if (traceThresholdInput) traceThresholdInput.value = trace.settings.threshold; if (traceBlurInput) traceBlurInput.value = trace.settings.blur; if (traceBackgroundInput) traceBackgroundInput.value = trace.settings.background; if (traceStageInput) traceStageInput.value = trace.stage ?? 0; if (traceFocusShapeInput) traceFocusShapeInput.value = trace.settings.focusShape || "none"; if (traceOutsideOpacityInput) traceOutsideOpacityInput.value = trace.settings.outsideOpacity ?? 25; if (quickTraceOpacityInput) quickTraceOpacityInput.value = trace.settings.assistOpacity ?? 1; if (overlayEmphasisInput) overlayEmphasisInput.value = trace.settings.overlayEmphasis ?? .5; if (overlayEmphasisOutput) { const emphasis = Number(trace.settings.overlayEmphasis ?? .5); overlayEmphasisOutput.textContent = emphasis < .2 ? "Camera" : emphasis > .8 ? "Overlay" : "Balanced"; } overlayReadabilityButtons?.forEach(button => button.classList.toggle("active", button.dataset.readability === (trace.settings.readabilityMode || "blend"))); if (traceGuideEnabledInput) traceGuideEnabledInput.checked = trace.guide.enabled; if (traceGuideModeInput) traceGuideModeInput.value = trace.guide.mode; if (traceGuideToleranceInput) traceGuideToleranceInput.value = trace.guide.tolerance; if (traceGuideSmoothingInput) traceGuideSmoothingInput.value = trace.guide.smoothing; if (traceGuidePauseButton) traceGuidePauseButton.textContent = trace.guide.running ? "Pause" : "Start"; traceGuide?.setSettings(trace.guide); updateTraceOutputs(); updateFocusWindow(trace); updateTraceQuickUI(layer); updateGuidedUI(layer); if (layerTraceMode) layerTraceMode.textContent = trace.mode;
 }
 function updateTraceOutputs() { if (traceStrengthOutput && traceStrengthInput) traceStrengthOutput.textContent = `${Math.round(Number(traceStrengthInput.value) * 100)}%`; if (traceDetailOutput && traceDetailInput) traceDetailOutput.textContent = `${Math.round(Number(traceDetailInput.value) * 100)}%`; if (tracePriorityOutput && tracePriorityInput) tracePriorityOutput.textContent = `${Math.round(Number(tracePriorityInput.value) * 100)}%`; if (traceThresholdOutput && traceThresholdInput) traceThresholdOutput.textContent = `${Math.round(Number(traceThresholdInput.value) * 100)}%`; if (traceBlurOutput && traceBlurInput) traceBlurOutput.textContent = traceBlurInput.value; }
 function updateTraceQuickUI(layer = activeLayer()) { const trace = layer ? traceState(layer) : DEFAULT_TRACE; traceModeChips?.querySelectorAll("[data-trace-mode]").forEach(button => button.classList.toggle("active", button.dataset.traceMode === trace.mode)); if (quickTraceModeButton) quickTraceModeButton.textContent = trace.mode === "Original" ? "Original" : trace.mode.replace(" Lines", ""); if (quickOriginalButton) quickOriginalButton.setAttribute("aria-pressed", String(trace.mode === "Original" || traceCompareHold)); if (quickAssistButton) quickAssistButton.setAttribute("aria-pressed", String(trace.enabled && !traceCompareHold)); }
 function setTraceSheet(nextState = "closed", view = "trace") { if (!adjustSheet) return; traceSheetState = nextState; const open = nextState !== "closed"; if (open && layersExpanded) { layersExpanded = false; if (layersList) layersList.hidden = true; layerCard?.classList.remove("layers-expanded"); layersToggle?.setAttribute("aria-expanded", "false"); } adjustSheet.classList.toggle("open", open); adjustSheet.dataset.state = nextState; adjustSheet.dataset.view = view; adjustSheet.setAttribute("aria-hidden", String(!open)); document.body.classList.toggle("sheet-open", open); document.body.classList.toggle("trace-mode", open && view === "trace"); stage?.classList.toggle("adjust-open", open); if (adjustTitle) adjustTitle.textContent = view === "trace" ? "Trace Assist" : "Adjust overlay"; if (quickTraceExpandButton) quickTraceExpandButton.textContent = nextState === "expanded" ? "⌄" : "⌃"; if (open) window.setTimeout(() => closeAdjust?.focus(), 0); }
-function setTraceMode(mode) { const layer = activeLayer(); if (!layer || !TRACE_MODES.includes(mode)) return; if (mode !== "Original") lastAssistMode = mode; traceState(layer).mode = mode; traceState(layer).enabled = mode !== "Original"; if (traceModeInput) traceModeInput.value = mode; applyTraceControls(layer); updateTraceQuickUI(layer); queueTraceRefresh(); }
+function bindSheetDrag() { if (!sheetHandle || !adjustSheet) return; let draggingSheet = false; sheetHandle.addEventListener("pointerdown", event => { if (!adjustSheet.classList.contains("open")) return; draggingSheet = true; sheetHandle.setPointerCapture?.(event.pointerId); event.preventDefault(); }); sheetHandle.addEventListener("pointerup", event => { if (!draggingSheet) return; draggingSheet = false; sheetHandle.releasePointerCapture?.(event.pointerId); const viewport = globalThis.visualViewport?.height || window.innerHeight; const ratio = Math.max(0, Math.min(1, (viewport - event.clientY) / viewport)); const next = ratio < .35 ? "peek" : ratio < .72 ? "half" : "expanded"; setTraceSheet(next, adjustSheet.dataset.view || "trace"); }); sheetHandle.addEventListener("pointercancel", () => { draggingSheet = false; }); }
+function setTraceMode(mode) { const layer = activeLayer(); if (!layer || !TRACE_MODES.includes(mode)) return; if (mode !== "Original") lastAssistMode = mode; traceState(layer).mode = mode; traceState(layer).enabled = mode !== "Original"; if (traceModeInput) traceModeInput.value = mode; applyTraceControls(layer); updateTraceQuickUI(layer); if (mode !== "Original") transitionAppState("Tracing", `trace mode: ${mode}`); queueTraceRefresh(); }
 function captureTraceControls(layer) { const trace = traceState(layer); trace.mode = TRACE_MODES.includes(traceModeInput?.value) ? traceModeInput.value : trace.mode; trace.enabled = trace.mode !== "Original"; trace.stage = Number(traceStageInput?.value) || 0; trace.settings = { ...trace.settings, strength: Number(traceStrengthInput?.value ?? trace.settings.strength), detail: Number(traceDetailInput?.value ?? trace.settings.detail), priority: Number(tracePriorityInput?.value ?? trace.settings.priority), lineWeight: traceLineWeightInput?.value || trace.settings.lineWeight, levels: Number(traceLevelsInput?.value ?? trace.settings.levels) || 0, isolation: Boolean(traceIsolationInput?.checked), threshold: Number(traceThresholdInput?.value ?? trace.settings.threshold), blur: Number(traceBlurInput?.value ?? trace.settings.blur), background: traceBackgroundInput?.value || trace.settings.background, focusShape: traceFocusShapeInput?.value || trace.settings.focusShape, outsideOpacity: Number(traceOutsideOpacityInput?.value ?? trace.settings.outsideOpacity) || 0, assistOpacity: Number(quickTraceOpacityInput?.value ?? trace.settings.assistOpacity) || 1, overlayEmphasis: Number(overlayEmphasisInput?.value ?? trace.settings.overlayEmphasis ?? .5), readabilityMode: trace.settings.readabilityMode || "blend", mask: normalizeTraceMask(trace.settings.mask) }; return trace; }
 function updateFocusWindow(trace = traceState(activeLayer() || { trace: DEFAULT_TRACE })) { if (!traceFocusWindow) return; const shape = trace.settings.focusShape || "none"; traceFocusWindow.hidden = !workspaceImage || shape === "none"; traceFocusWindow.dataset.shape = shape; traceFocusWindow.style.setProperty("--outside-opacity", String(Math.max(0, Math.min(1, (trace.settings.outsideOpacity ?? 25) / 100)))); }
 function traceSettings(layer, preview = false) { const trace = traceState(layer); return normalizeTraceSettings({ mode: trace.mode, ...trace.settings, stage: trace.stage, preview }); }
@@ -319,7 +406,7 @@ function loadLayerState(layer) {
   if (!layer) return;
   activeLayerId = layer.id; workspaceImage = layer.image; x = Number(layer.x) || 0; y = Number(layer.y) || 0; scale = Number(layer.scale) || 1; rotation = Number(layer.rotation) || 0; opacity = Number(layer.opacity) || .55; flipped = Boolean(layer.flipped);
   if (blendModeInput) blendModeInput.value = layer.blendMode || "Normal"; if (guideInput) guideInput.value = layer.guide || "none"; guides.setMode(layer.guide || "none"); physicalCalibration = layer.physicalCalibration || null; if (opacityInput) opacityInput.value = opacity; if (scaleInput) scaleInput.value = scale; if (rotationInput) rotationInput.value = rotation; if (positionXNumber) positionXNumber.value = Math.round(x); if (positionYNumber) positionYNumber.value = Math.round(y); blendSwatches?.querySelectorAll("[data-blend]").forEach(button => button.classList.toggle("active", button.dataset.blend === (layer.blendMode || "Normal")));
-  activePerspectiveQuad = layer.perspective?.quad ? layer.perspective.quad.map(point => ({ ...point })) : null; perspectiveActive = Boolean(activePerspectiveQuad?.length === 4); surfaceTracker.locked = Boolean(layer.perspective?.locked); overlay.src = layer.image; overlay.hidden = layer.visible === false; overlay.style.visibility = "visible"; const display = resolveOverlayDisplay({ visible: layer.visible !== false, perspective: perspectiveActive }); overlay.style.display = display.overlay ? "block" : "none"; if (display.perspective) snapController.snap(activeRenderSource(), perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); else snapController.clear(); if (layerThumb) layerThumb.src = workspaceImage; if (layerName) layerName.textContent = layer.name; traceGuideContourIndex = 0; applyLocks({ position: Boolean(layer.locked) }); applyTraceControls(layer); refreshTraceView(layer);
+  activePerspectiveQuad = layer.perspective?.quad ? layer.perspective.quad.map(point => ({ ...point })) : null; perspectiveActive = Boolean(activePerspectiveQuad?.length === 4); surfaceTracker.locked = Boolean(layer.perspective?.locked); overlay.src = layer.image; overlay.hidden = layer.visible === false; overlay.style.visibility = "visible"; const display = resolveOverlayDisplay({ visible: layer.visible !== false, perspective: perspectiveActive }); overlay.style.display = display.overlay ? "block" : "none"; if (display.perspective) snapController.snap(activeRenderSource(), perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); else snapController.clear(); if (layerThumb) layerThumb.src = workspaceImage; if (layerName) layerName.textContent = layer.name; traceGuideContourIndex = 0; applyLocks({ position: Boolean(layer.locked) }); applyTraceControls(layer); updateRegionUI(layer); refreshTraceView(layer);
 }
 
 function renderLayerElement(element, layer, index) {
@@ -395,14 +482,46 @@ function renderOverlay() {
   if (perspectiveOverlay && !perspectiveOverlay.hidden) perspectiveOverlay.style.opacity = opacity;
   applyBlendMode(overlay, blendModeInput?.value || "Normal");
   applyBlendMode(perspectiveOverlay, blendModeInput?.value || "Normal");
-  renderLayers();
+  renderLayers(); renderRegionOverlay();
 }
 
-function captureState() { return { x, y, scale, rotation, opacity, flipped, blendMode: blendModeInput?.value || "Normal", guide: guideInput?.value || "none", physicalCalibration }; }
+function setFreezeCamera(enabled) {
+  freezeCamera = Boolean(enabled);
+  if (freezeCamera && camera?.videoWidth && freezeFrame) {
+    freezeFrame.width = camera.videoWidth;
+    freezeFrame.height = camera.videoHeight;
+    freezeFrame.getContext("2d")?.drawImage(camera, 0, 0, freezeFrame.width, freezeFrame.height);
+  }
+  if (camera) camera.hidden = freezeCamera;
+  if (freezeFrame) freezeFrame.hidden = !freezeCamera;
+  freezeFrame?.classList.toggle("selfie-camera", camera?.classList.contains("selfie-camera"));
+  freezeCameraButton?.classList.toggle("active", freezeCamera);
+  freezeCameraButton?.setAttribute("aria-pressed", String(freezeCamera));
+  if (freezeCameraButton) freezeCameraButton.textContent = freezeCamera ? "Unfreeze camera" : "Freeze camera";
+  stage?.classList.toggle("camera-frozen", freezeCamera);
+}
+
+function captureCurrentDrawing() {
+  const source = freezeCamera ? freezeFrame : camera; if (!source?.videoWidth && !source?.width) { status.textContent = "Camera is not ready for capture."; return null; }
+  const canvas = document.createElement("canvas"); canvas.width = source.videoWidth || source.width; canvas.height = source.videoHeight || source.height; canvas.getContext("2d")?.drawImage(source, 0, 0, canvas.width, canvas.height); finishedDrawingImage = canvas.toDataURL("image/jpeg", .9); updateComparisonUI(); if (comparisonStatus) comparisonStatus.textContent = "Finished drawing captured. Ready to compare."; addTimeline("Captured", "Finished drawing"); return finishedDrawingImage;
+}
+
+function updateComparisonUI() { if (compareDrawingButton) compareDrawingButton.disabled = !finishedDrawingImage; if (comparisonStatus && !finishedDrawingImage) comparisonStatus.textContent = "No finished drawing captured."; }
+
+function loadImageData(source) { return new Promise((resolve, reject) => { if (!source) return reject(new Error("Missing image source")); const image = new Image(); image.onload = () => { const canvas = document.createElement("canvas"); canvas.width = image.naturalWidth || image.width; canvas.height = image.naturalHeight || image.height; const context = canvas.getContext("2d"); if (!context) return reject(new Error("Canvas processing is unavailable")); context.drawImage(image, 0, 0, canvas.width, canvas.height); resolve(context.getImageData(0, 0, canvas.width, canvas.height)); }; image.onerror = () => reject(new Error("Could not decode comparison image")); image.src = source; }); }
+
+async function compareFinishedDrawing() {
+  if (!finishedDrawingImage || !activeLayer()?.image) { status.textContent = "Capture a finished drawing before comparing."; return; }
+  try { const result = compareImageData(await loadImageData(activeLayer().image), await loadImageData(finishedDrawingImage)); if (result.status !== "complete" || !comparisonOverlay) throw new Error("Comparison requires two valid images."); comparisonOverlay.width = result.width; comparisonOverlay.height = result.height; comparisonOverlay.getContext("2d")?.putImageData(new ImageData(result.diff.data, result.width, result.height), 0, 0); comparisonOverlay.hidden = false; comparisonActive = true; overlay.classList.add("comparison-hidden"); perspectiveOverlay.classList.add("comparison-hidden"); compareDrawingButton.textContent = "Hide comparison"; if (comparisonStatus) comparisonStatus.textContent = comparisonSummary(result); transitionAppState("Comparing", "finished drawing comparison"); } catch (error) { if (comparisonStatus) comparisonStatus.textContent = "Comparison failed · capture a clearer finished drawing."; status.textContent = "Could not compare those images."; console.error("[TraceLens comparison] failed", error); }
+}
+
+function clearFinishedComparison() { comparisonActive = false; comparisonOverlay.hidden = true; overlay.classList.remove("comparison-hidden"); perspectiveOverlay.classList.remove("comparison-hidden"); if (compareDrawingButton) compareDrawingButton.textContent = "Compare drawing"; transitionAppState(workspaceImage ? "Reviewing" : "Home", "comparison closed"); }
+
+function captureState() { return { x, y, scale, rotation, opacity, flipped, freezeCamera, blendMode: blendModeInput?.value || "Normal", guide: guideInput?.value || "none", physicalCalibration }; }
 function captureLayers() { syncActiveLayer(); return cloneLayers(layers); }
 function applyState(next) {
   if (!next) return;
-  x = Number(next.x) || 0; y = Number(next.y) || 0; scale = Number(next.scale) || 1; rotation = Number(next.rotation) || 0; opacity = Number(next.opacity) || .55; flipped = Boolean(next.flipped);
+  x = Number(next.x) || 0; y = Number(next.y) || 0; scale = Number(next.scale) || 1; rotation = Number(next.rotation) || 0; opacity = Number(next.opacity) || .55; flipped = Boolean(next.flipped); setFreezeCamera(Boolean(next.freezeCamera));
   if (blendModeInput) blendModeInput.value = next.blendMode || "Normal"; if (guideInput) guideInput.value = next.guide || "none"; guides.setMode(next.guide || "none");
   physicalCalibration = next.physicalCalibration || null;
   if (opacityInput) opacityInput.value = opacity; if (scaleInput) scaleInput.value = scale; if (rotationInput) rotationInput.value = rotation; renderOverlay(); renderLayerList();
@@ -411,13 +530,13 @@ function historySourceId(image) { if (!image) return null; if (!historySourceIds
 function workspaceState() { syncActiveLayer(); return { layers: layers.map(layer => { const { image, thumbnail, ...state } = layer; return { ...state, sourceId: historySourceId(image) }; }), activeLayerId, locks: { ...locks }, ...captureState() }; }
 function pushHistory() { if (workspaceImage && !historyRestoring) history.push(workspaceState()); }
 function restoreWorkspaceState(next) { if (!next) return; historyRestoring = true; try { if (Array.isArray(next.layers) && next.layers.length) { const restored = next.layers.map(layer => ({ ...layer, image: layer.image || historySources.get(layer.sourceId) })).filter(layer => layer.image); setLayers(restored, next.activeLayerId); } applyState(next); applyLocks(next.locks || activeLayer()?.locks || {}); updateContext(); } finally { historyRestoring = false; } }
-function addTimeline(type, detail = "") { timeline.add(type, detail); const latest = timeline.latest(); if (timelineOutput) timelineOutput.textContent = latest ? `${latest.type}${latest.detail ? ` · ${latest.detail}` : ""}` : "Session ready."; }
+function addTimeline(type, detail = "") { timeline.add(type, detail); recordSession(type, { detail }); const latest = timeline.latest(); if (timelineOutput) timelineOutput.textContent = latest ? `${latest.type}${latest.detail ? ` · ${latest.detail}` : ""}` : "Session ready."; }
 function applyLocks(saved = {}) { Object.keys(locks).forEach(key => { if (typeof locks[key] === "boolean") locks[key] = Boolean(saved[key]); const input = document.querySelector(`[data-lock="${key}"]`); if (input) input.checked = locks[key]; }); stage?.classList.toggle("locked", locks.position); if (layerLock) { layerLock.textContent = locks.position ? "♙" : "♧"; layerLock.setAttribute("aria-label", locks.position ? "Unlock overlay" : "Lock overlay"); } }
 function applyProject(project) {
   const projectImage = project?.image || project?.layers?.find(layer => layer?.image)?.image;
   if (!projectImage) { status.textContent = "That project has no usable reference image."; return false; }
   traceQueue?.cancel(); traceEngine.cancel(); traceEngine.clearSources(); traceResults.clear(); history.clear(); historySources.clear(); historySourceIds.clear();
-  currentProjectId = project.id || null; projectNameInput.value = project.name || "Untitled project"; emptyState.style.display = "none"; layerCard.hidden = false; selectionFrame.classList.add("visible"); showOverlayTools();
+  currentProjectId = project.id || null; finishedDrawingImage = project.finishedDrawingImage || null; sessionReplay = createSessionState(project.session); updateComparisonUI(); projectNameInput.value = project.name || "Untitled project"; emptyState.style.display = "none"; layerCard.hidden = false; selectionFrame.classList.add("visible"); showOverlayTools();
   const restoredLayers = Array.isArray(project.layers) && project.layers.length ? project.layers : [legacyLayer(project, project.name || "Reference image")];
   setLayers(restoredLayers, project.activeLayerId || restoredLayers.at(-1).id);
   if (project.preset) { presetInput.value = project.preset; applyPreset(project.preset, false); } applyState(project); applyLocks(project.locks); updateContext(); pushHistory(); surfaceTracker.start(camera); queueVisibleTraceLayers(); return true;
@@ -425,7 +544,7 @@ function applyProject(project) {
 let projectSearchToken = 0;
 async function refreshProjectList() { const request = ++projectSearchToken; try { let projects = await projectLibrary.all(); if (request !== projectSearchToken) return; const query = projectSearchInput.value.trim().toLowerCase(); if (query) projects = projects.filter(project => (project.name || "").toLowerCase().includes(query) || (project.preset || "").toLowerCase().includes(query)); const sort = projectSortInput.value; projects.sort((a, b) => sort === "name" ? (a.name || "").localeCompare(b.name || "") : sort === "created" ? b.createdAt - a.createdAt : sort === "favorite" ? Number(b.favorite) - Number(a.favorite) || b.updatedAt - a.updatedAt : b.updatedAt - a.updatedAt); projectList.replaceChildren(new Option(projects.length ? "Projects" : "No projects yet", ""), ...projects.map(project => new Option(`${project.favorite ? "★ " : ""}${project.name || "Untitled project"} · ${new Date(project.updatedAt || Date.now()).toLocaleDateString()}`, project.id))); } catch (error) { if (request !== projectSearchToken) return; console.error("[TraceLens projects] list failed", error); status.textContent = "Project storage is unavailable. Try again."; } }
 const debouncedProjectSearch = createDebouncedTask(() => refreshProjectList(), 140);
-function applyPreset(name, announce = true) { const preset = getWorkflowPreset(name); presetInput.value = name; opacity = preset.opacity; opacityInput.value = opacity; blendModeInput.value = preset.blendMode; guideInput.value = preset.guide; guides.setMode(preset.guide); grid.style.backgroundSize = `${100 / preset.gridSpacing}% ${100 / preset.gridSpacing}%`; surfaceTracker.state.retainAt = preset.tracking.weakAt; surfaceTracker.state.acquireAt = Math.max(72, preset.tracking.weakAt + 12); surfaceTracker.state.lostAt = preset.tracking.lostAt; renderOverlay(); updatePresetChips(); if (announce) { status.textContent = `${name} workspace active.`; addTimeline("Preset", name); } }
+function applyPreset(name, announce = true) { const preset = getWorkflowPreset(name); presetInput.value = name; opacity = preset.opacity; opacityInput.value = opacity; blendModeInput.value = preset.blendMode; guideInput.value = preset.guide; guides.setMode(preset.guide); grid.style.backgroundSize = `${100 / preset.gridSpacing}% ${100 / preset.gridSpacing}%`; surfaceTracker.state.retainAt = preset.tracking.weakAt; surfaceTracker.state.acquireAt = Math.max(72, preset.tracking.weakAt + 12); surfaceTracker.state.lostAt = preset.tracking.lostAt; if (presetDescription) presetDescription.textContent = preset.description || "Choose a workspace to tune alignment defaults."; renderOverlay(); updatePresetChips(); if (announce) { status.textContent = `${name} workspace active.`; addTimeline("Preset", name); } }
 function applyPhysicalCalibration() {
   const reference = CALIBRATION_REFERENCES[calibrationReference.value];
   const desired = Number(calibrationWidth.value);
@@ -447,20 +566,22 @@ function saveWorkspace() {
     status.textContent = "Import an image before saving a workspace.";
     return;
   }
-  localStorage.setItem(WORKSPACE_KEY, JSON.stringify({ image: workspaceImage, layers: captureLayers(), activeLayerId, ...captureState() }));
+  localStorage.setItem(WORKSPACE_KEY, JSON.stringify({ image: workspaceImage, layers: captureLayers(), activeLayerId, session: sessionReplay, ...captureState() }));
   workspaceButton.classList.add("saved");
   status.textContent = "Workspace saved on this device.";
   window.setTimeout(() => workspaceButton.classList.remove("saved"), 900);
 }
 
 async function saveProject() {
+  transitionAppState("Saving", "project save");
   if (!workspaceImage) { status.textContent = "Import an image before saving a project."; return; }
   const name = projectNameInput.value.trim() || "Untitled project";
   currentProjectId ||= globalThis.crypto?.randomUUID?.() || `project-${Date.now()}`;
   const savedLayers = captureLayers(); await Promise.all(savedLayers.map(async layer => { if (!layer.thumbnail) layer.thumbnail = await projectLibrary.thumbnail(layer.image); }));
-  await projectLibrary.put({ id: currentProjectId, name, image: workspaceImage, layers: savedLayers, activeLayerId, preset: presetInput.value, perspective: surfaceTracker.locked ? activePerspectiveQuad : null, perspectiveLocked: surfaceTracker.locked, ...captureState(), locks: { ...locks }, updatedAt: Date.now(), thumbnail: await projectLibrary.thumbnail(workspaceImage) });
+  await projectLibrary.put({ id: currentProjectId, name, image: workspaceImage, layers: savedLayers, activeLayerId, finishedDrawingImage, session: sessionReplay, preset: presetInput.value, perspective: surfaceTracker.locked ? activePerspectiveQuad : null, perspectiveLocked: surfaceTracker.locked, ...captureState(), locks: { ...locks }, updatedAt: Date.now(), thumbnail: await projectLibrary.thumbnail(workspaceImage) });
   await refreshProjectList(); addTimeline("Saved", name);
   status.textContent = `Project “${name}” saved.`;
+  transitionAppState(workspaceImage ? "Tracing" : "Home", "project saved");
 }
 
 async function restoreLatestProject() {
@@ -474,7 +595,7 @@ function restoreWorkspace() {
     if (!saved?.image) return;
     traceQueue?.cancel(); traceEngine.cancel(); traceEngine.clearSources(); traceResults.clear(); history.clear(); historySources.clear(); historySourceIds.clear();
     const restoredLayers = Array.isArray(saved.layers) && saved.layers.length ? saved.layers : [legacyLayer(saved, "Saved workspace")];
-    currentProjectId = null; emptyState.style.display = "none"; layerCard.hidden = false; selectionFrame.classList.add("visible"); showOverlayTools(); setLayers(restoredLayers, saved.activeLayerId || restoredLayers.at(-1).id);
+    currentProjectId = null; sessionReplay = createSessionState(saved.session); emptyState.style.display = "none"; layerCard.hidden = false; selectionFrame.classList.add("visible"); showOverlayTools(); setLayers(restoredLayers, saved.activeLayerId || restoredLayers.at(-1).id);
     applyState(saved); status.textContent = "Saved workspace restored.";
     addTimeline("Restored", "Workspace");
     pushHistory();
@@ -494,6 +615,7 @@ async function startCamera() {
     camera.classList.toggle("selfie-camera", cameraFacing === "user");
     cameraState.textContent = "CAMERA ACTIVE";
     status.textContent = "Camera active.";
+    if (freezeCamera) setFreezeCamera(true);
     if (workspaceImage) surfaceTracker.start(camera);
     return stream;
   } catch (error) {
@@ -507,8 +629,10 @@ function loadImage(file) {
   if (!file) return;
   if (!file.type?.startsWith("image/")) { status.textContent = "Choose a supported image file."; return; }
   if (file.size > 25 * 1024 * 1024) { status.textContent = "That image is larger than 25 MB. Choose a smaller file."; return; }
+  transitionAppState("Importing", "image selected");
   const reader = new FileReader();
   reader.onload = () => {
+    transitionAppState("PreparingImage", "image decoded");
     snapController.clear();
     perspectiveActive = false;
     surfaceTracker.unlock(); surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; autoPerspectiveButton?.classList.remove("active");
@@ -525,12 +649,13 @@ function loadImage(file) {
     showOverlayTools();
     pushHistory();
     if (gestureHint) gestureHint.hidden = false;
-    addTimeline("Imported", file.name); gestureCoach.show();
+    sessionReplay = startSession(sessionReplay); addTimeline("Imported", file.name); gestureCoach.show();
     status.textContent = "Overlay loaded. Drag, pinch, or rotate to position it.";
     updateContext();
     surfaceTracker.start(camera);
+    transitionAppState("Positioning", "reference ready");
   };
-  reader.onerror = () => { status.textContent = "Could not read that image. Try another file."; console.error("[TraceLens import] FileReader failed", reader.error); };
+  reader.onerror = () => { transitionAppState("Error", "image read failed"); status.textContent = "Could not read that image. Try another file."; console.error("[TraceLens import] FileReader failed", reader.error); };
   reader.readAsDataURL(file);
 }
 
@@ -564,6 +689,9 @@ document.querySelectorAll("[data-step-target]").forEach(button => button.addEven
 }));
 cameraButton?.addEventListener("click", () => startCamera().catch(() => {}));
 cameraFacingButton?.addEventListener("click", () => { cameraFacing = cameraFacing === "environment" ? "user" : "environment"; globalThis.localStorage?.setItem("tracelens-camera-facing", cameraFacing); startCamera().catch(() => {}); });
+freezeCameraButton?.addEventListener("click", () => { setFreezeCamera(!freezeCamera); pushHistory(); status.textContent = freezeCamera ? "Camera frame frozen." : "Live camera restored."; });
+captureDrawingButton?.addEventListener("click", () => captureCurrentDrawing());
+compareDrawingButton?.addEventListener("click", () => { if (comparisonActive) clearFinishedComparison(); else compareFinishedDrawing(); });
 gridButton?.addEventListener("click", () => { grid.classList.toggle("visible"); gridButton.classList.toggle("active"); });
 flipButton?.addEventListener("click", () => { flipped = !flipped; flipButton.classList.toggle("active", flipped); renderOverlay(); });
 adjustButton?.addEventListener("click", () => { const opening = !adjustSheet.classList.contains("open"); if (opening) lastAdjustFocus = document.activeElement; setTraceSheet(opening ? "expanded" : "closed", "normal"); if (!opening && lastAdjustFocus?.focus) lastAdjustFocus.focus(); });
@@ -604,9 +732,9 @@ autoOpacityInput?.addEventListener("change", event => { adaptiveOpacity.setEnabl
 autoPerspectiveButton?.addEventListener("click", () => {
   if (perspectiveActive && surfaceTracker.locked) { snapController.clear(); perspectiveActive = false; activePerspectiveQuad = null; surfaceTracker.unlock(); perspectiveSession.unlock(); autoPerspectiveScanning = false; autoPerspectiveButton.classList.remove("active"); restoreLayerVisibility(); selectionFrame.style.clipPath = "none"; pushHistory(); status.textContent = "Manual mode."; visionStatus.textContent = "Manual mode"; updateContext(); return; }
   if (autoPerspectiveScanning) { surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; autoPerspectiveButton.classList.remove("active"); visionStatus.textContent = "Manual mode"; status.textContent = "Surface scan cancelled."; updateContext(); return; }
-  autoPerspectiveScanning = true; surfaceTracker.beginScan(); perspectiveSession.beginScan(); surfaceTracker.start(camera); autoPerspectiveButton.classList.add("active"); visionStatus.textContent = "Scanning surface…"; status.textContent = "Scanning surface. Hold steady."; updateContext();
+  autoPerspectiveScanning = true; surfaceTracker.beginScan(); perspectiveSession.beginScan(); surfaceTracker.start(camera); transitionAppState("ScanningSurface", "automatic surface scan"); autoPerspectiveButton.classList.add("active"); visionStatus.textContent = "Scanning surface…"; status.textContent = "Scanning surface. Hold steady."; updateContext();
 });
-manualPerspectiveButton?.addEventListener("click", () => { surfaceTracker.unlock(); surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; activePerspectiveQuad = [{ x: .08, y: .08 }, { x: .92, y: .08 }, { x: .92, y: .92 }, { x: .08, y: .92 }]; perspectiveActive = true; autoPerspectiveButton.classList.remove("active"); overlay.style.display = "none"; snapController.snap(activeRenderSource(), perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; syncActiveLayer(); pushHistory(); status.textContent = "Manual mode · adjust corners."; visionStatus.textContent = "Manual mode"; updateContext(); });
+manualPerspectiveButton?.addEventListener("click", () => { surfaceTracker.unlock(); surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; activePerspectiveQuad = [{ x: .08, y: .08 }, { x: .92, y: .08 }, { x: .92, y: .92 }, { x: .08, y: .92 }]; perspectiveActive = true; transitionAppState("Calibrating", "manual four-corner calibration"); autoPerspectiveButton.classList.remove("active"); overlay.style.display = "none"; snapController.snap(activeRenderSource(), perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; syncActiveLayer(); pushHistory(); status.textContent = "Manual mode · adjust corners."; visionStatus.textContent = "Manual mode"; updateContext(); });
 layerVisibility?.addEventListener("click", () => { overlay.hidden = !overlay.hidden; const layer = activeLayer(); if (layer) layer.visible = !overlay.hidden; restoreLayerVisibility(layer); layerVisibility.textContent = overlay.hidden ? "⊘" : "◉"; layerVisibility.setAttribute("aria-label", overlay.hidden ? "Show overlay" : "Hide overlay"); pushHistory(); });
 layerLock?.addEventListener("click", () => { locks.toggle("position"); const layer = activeLayer(); if (layer) layer.locked = locks.position; stage.classList.toggle("locked", locks.position); layerLock.textContent = locks.position ? "♙" : "♧"; layerLock.setAttribute("aria-label", locks.position ? "Unlock overlay" : "Lock overlay"); pushHistory(); });
 layerAdd?.addEventListener("click", () => dockImageInput?.click());
@@ -633,6 +761,7 @@ resetButton?.addEventListener("click", () => { x = 0; y = 0; scale = 1; rotation
 
 function setComparing(next) {
   comparing = next;
+  transitionAppState(next ? "Comparing" : (workspaceImage ? "Reviewing" : "Home"), next ? "before comparison" : "comparison closed");
   overlay.classList.toggle("comparison-hidden", comparing);
   perspectiveOverlay.classList.toggle("comparison-hidden", comparing);
   compareButton.classList.toggle("active", comparing);
@@ -672,12 +801,12 @@ stage?.addEventListener("pointerup", () => window.clearTimeout(longPressTimer));
 stage?.addEventListener("pointercancel", () => { window.clearTimeout(longPressTimer); pointers.clear(); gestureStart = null; dragging = false; });
 window.addEventListener("blur", () => { window.clearTimeout(longPressTimer); pointers.clear(); gestureStart = null; dragging = false; });
 }
-document.addEventListener("visibilitychange", () => { if (document.hidden) { traceEngine.cancel(); surfaceTracker.stop(); traceGuide.pause(); traceHandTracker.stop(); } else if (camera.srcObject && workspaceImage) { surfaceTracker.start(camera); const layer = activeLayer(); if (layer?.trace?.enabled) refreshTraceView(layer); if (layer?.trace?.guide?.enabled) traceGuide.enable(); } });
+document.addEventListener("visibilitychange", () => { if (document.hidden) { traceEngine.cancel(); surfaceTracker.stop(); traceGuide.pause(); traceHandTracker.stop(); if (sessionReplay.status === "recording") sessionReplay = pauseSession(sessionReplay); updateSessionUI(); } else if (camera.srcObject && workspaceImage) { surfaceTracker.start(camera); const layer = activeLayer(); if (layer?.trace?.enabled) refreshTraceView(layer); if (layer?.trace?.guide?.enabled) traceGuide.enable(); if (sessionReplay.status === "paused") sessionReplay = resumeSession(sessionReplay); updateSessionUI(); } });
 window.addEventListener("keydown", event => { if (event.key === "Escape" && adjustSheet.classList.contains("open")) { closeAdjust.click(); } });
 let visionFrameId = 0;
 let visionLoopStarted = false;
-function requestVisionFrame(now = performance.now()) { diagnostics.frame(); if (workspaceImage && !document.hidden && camera.srcObject) adaptiveOpacity.update(camera, now); diagnostics.render({ tracking: surfaceTracker.state.confidence, camera: camera.videoWidth ? `${camera.videoWidth}×${camera.videoHeight}` : "—", quality: perspectiveActive ? "perspective" : "high", trace: diagnosticsInput?.checked ? traceEngine.diagnostics() : null, ...latestSurfaceDiagnostics }); visionFrameId = requestAnimationFrame(requestVisionFrame); }
-function updateViewportHeight() { const height = globalThis.visualViewport?.height || window.innerHeight; document.documentElement.style.setProperty("--app-viewport-height", `${Math.round(height)}px`); }
+function requestVisionFrame(now = performance.now()) { diagnostics.frame(); if (workspaceImage && !document.hidden && camera.srcObject) adaptiveOpacity.update(camera, now); diagnostics.render({ appState: appStateMachine.state, tracking: surfaceTracker.state.confidence, camera: camera.videoWidth ? `${camera.videoWidth}×${camera.videoHeight}` : "—", quality: perspectiveActive ? "perspective" : "high", trace: diagnosticsInput?.checked ? traceEngine.diagnostics() : null, ...latestSurfaceDiagnostics }); visionFrameId = requestAnimationFrame(requestVisionFrame); }
+function updateViewportHeight() { const height = globalThis.visualViewport?.height || window.innerHeight; document.documentElement.style.setProperty("--app-viewport-height", `${Math.round(height)}px`); renderRegionOverlay(); }
 updateViewportHeight(); window.addEventListener("resize", updateViewportHeight, { passive: true }); window.visualViewport?.addEventListener("resize", updateViewportHeight, { passive: true }); window.visualViewport?.addEventListener("scroll", updateViewportHeight, { passive: true });
 
 function initializeCoreUI() {
@@ -686,8 +815,10 @@ function initializeCoreUI() {
   if (missing.length) throw new Error(`TraceLens core UI missing: ${missing.join(", ")}`);
   if (gestureHint) gestureHint.hidden = true;
   organizeTraceControls();
+  bindSheetDrag();
   renderOverlay();
   updateContext();
+  transitionAppState("Home", "core UI ready");
 }
 
 function initializeCamera() {
