@@ -1,0 +1,19 @@
+import assert from "node:assert/strict";
+import { videoToStage, stageToVideo, layerToStage, smoothPoint, predictPoint, createContourTarget, nearestContourPoint, resampleContour } from "../trace-guide-math.js";
+import { pinchPoint, GuidePointFilter } from "../guide-point.js";
+import { calibrateToolOffset, estimateToolPoint, normalizeToolCalibration } from "../tool-calibration.js";
+import { DEFAULT_GUIDE_STATE, normalizeGuideState, updateGuideProgress } from "../trace-guide-state.js";
+
+const dimensions = { videoWidth: 1920, videoHeight: 1080, stageWidth: 390, stageHeight: 844, mirrored: false, fit: "cover" };
+const center = videoToStage({ x: .5, y: .5 }, dimensions); assert.equal(center.x, 195); assert.equal(center.y, 422); assert.ok(Math.abs(center.cropX - 555.22) < .01); assert.equal(center.cropY, 0);
+const mirrored = videoToStage({ x: .25, y: .5 }, { ...dimensions, mirrored: true }); assert.ok(mirrored.x > center.x); const roundTrip = stageToVideo(center, dimensions); assert.ok(Math.abs(roundTrip.x - .5) < .001); assert.ok(Math.abs(roundTrip.y - .5) < .001);
+const transformed = layerToStage({ x: .5, y: .5 }, { width: 390, height: 844, x: 10, y: -20, scale: 1, rotation: 90 }); assert.deepEqual(transformed, { x: 205, y: 402 });
+assert.deepEqual(smoothPoint({ x: 0, y: 0 }, { x: 10, y: 10 }, "Strong"), { x: 1.2, y: 1.2 }); const predicted = predictPoint({ x: 10, y: 10 }, { x: 0, y: 0 }, .1, .9, 2); assert.ok(predicted.x > 11 && predicted.y > 11 && predicted.x < 12 && predicted.y < 12);
+const filter = new GuidePointFilter({ smoothing: "Light", prediction: false }); filter.update({ x: 0, y: 0 }, 0); assert.ok(filter.update({ x: 10, y: 0 }, 100, 1).stabilized.x > 0);
+assert.equal(pinchPoint([{ x: 0, y: 0 }, {}, {}, {}, { x: .4, y: .4 }, {}, {}, {}, { x: .45, y: .45 }], .1).active, true);
+const calibration = calibrateToolOffset([{ x: .4, y: .45 }, { x: .42, y: .46 }], { x: .5, y: .5 }, "Pen", "right", "environment"); assert.ok(calibration.offset.x > 0); assert.equal(estimateToolPoint({ x: .4, y: .45 }, calibration).estimated, true); assert.equal(normalizeToolCalibration({ profile: "bad" }).profile, "Pencil");
+const line = createContourTarget([{ x: 0, y: 100 }, { x: 100, y: 100 }, { x: 200, y: 100 }], { spacing: 10 }); assert.ok(resampleContour([{ x: 0, y: 0 }, { x: 100, y: 0 }], 10).length >= 10); const nearest = nearestContourPoint(line, { x: 72, y: 106 }, { progressIndex: 5, searchRadius: 8 }); assert.ok(nearest.distance < 7); assert.ok(nearest.progress > 60 && nearest.progress < 80);
+const crossing = createContourTarget([{ x: 0, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }, { x: 100, y: 0 }], { spacing: 10 }); const local = nearestContourPoint(crossing, { x: 52, y: 52 }, { progressIndex: 4, searchRadius: 2 }); assert.ok(local.index <= 6); const recovered = nearestContourPoint(crossing, { x: 52, y: 52 }, { progressIndex: 4, searchRadius: 2, allowGlobal: true }); assert.ok(recovered.distance <= local.distance);
+const initial = normalizeGuideState({ ...DEFAULT_GUIDE_STATE, running: true }); const progressed = updateGuideProgress(initial, nearest, line, { confidence: .9, acquisitionRadius: 22 }); assert.equal(progressed.status, "Aligned"); const offPath = updateGuideProgress(progressed, { ...nearest, distance: 100 }, line, { confidence: .9, acquisitionRadius: 22 }); assert.equal(offPath.status, "Off path"); const lost = updateGuideProgress(progressed, null, line, { confidence: .2 }); assert.equal(lost.status, "Tracking lost"); assert.equal(lost.running, false); assert.equal(updateGuideProgress(lost, nearest, line, { confidence: .9, acquisitionRadius: 22 }).running, true);
+const closed = createContourTarget([{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }], { closed: true, spacing: 5 }); assert.ok(closed.totalLength > 25); assert.ok(nearestContourPoint(closed, { x: 0, y: 1 }, { progressIndex: 0, searchRadius: 4 }));
+console.log("trace guide tests passed");

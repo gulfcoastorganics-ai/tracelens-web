@@ -6,7 +6,7 @@ const css = readFileSync(new URL("../style.css", import.meta.url), "utf8");
 const app = readFileSync(new URL("../app.js", import.meta.url), "utf8");
 const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map(match => match[1]);
 assert.equal(new Set(ids).size, ids.length, "HTML IDs must remain unique");
-for (const id of ["quickTraceBar", "quickOriginalButton", "quickAssistButton", "quickTraceExpandButton", "traceModeChips", "traceDetailInput", "tracePriorityInput", "traceQuality", "layersToggle", "adjustSheet"]) assert.ok(html.includes(`id="${id}"`), `missing ${id}`);
+for (const id of ["quickTraceBar", "quickOriginalButton", "quickAssistButton", "quickTraceExpandButton", "traceModeChips", "traceDetailInput", "tracePriorityInput", "traceQuality", "traceGuideOverlay", "traceGuideEnabledInput", "traceGuideModeInput", "traceGuideStatus", "layersToggle", "adjustSheet"]) assert.ok(html.includes(`id="${id}"`), `missing ${id}`);
 assert.match(css, /100dvh|--app-viewport-height/);
 assert.match(css, /safe-area-inset-bottom/);
 assert.match(css, /trace-mode-chips/);
