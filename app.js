@@ -12,6 +12,9 @@ import { getWorkflowPreset } from "./workflow-presets.js";
 import { createProjectBundle, validateProjectBundle, downloadProjectBundle } from "./project-bundles.js";
 import { CalibrationProfiles } from "./calibration-profiles.js";
 import { SessionTimeline } from "./session-timeline.js";
+import { CALIBRATION_REFERENCES, calculateCalibration, fromMillimeters } from "./physical-calibration.js";
+import { GestureCoach } from "./onboarding.js";
+import { registerPWA } from "./pwa.js";
 
 const camera = document.querySelector("#camera");
 const overlay = document.querySelector("#overlay");
@@ -24,6 +27,7 @@ const opacityInput = document.querySelector("#opacityInput");
 const scaleInput = document.querySelector("#scaleInput");
 const rotationInput = document.querySelector("#rotationInput");
 const cameraButton = document.querySelector("#cameraButton");
+const cameraFacingButton = document.querySelector("#cameraFacingButton");
 const cameraState = document.querySelector("#cameraState");
 const gridButton = document.querySelector("#gridButton");
 const flipButton = document.querySelector("#flipButton");
@@ -46,13 +50,25 @@ const diagnosticsInput = document.querySelector("#diagnosticsInput");
 const diagnosticsOutput = document.querySelector("#diagnosticsOutput");
 const presetInput = document.querySelector("#presetInput");
 const projectList = document.querySelector("#projectList");
+const projectSearchInput = document.querySelector("#projectSearchInput");
+const projectSortInput = document.querySelector("#projectSortInput");
 const loadProjectButton = document.querySelector("#loadProjectButton");
+const duplicateProjectButton = document.querySelector("#duplicateProjectButton");
+const favoriteProjectButton = document.querySelector("#favoriteProjectButton");
 const deleteProjectButton = document.querySelector("#deleteProjectButton");
 const exportProjectButton = document.querySelector("#exportProjectButton");
 const importProjectInput = document.querySelector("#importProjectInput");
 const profileInput = document.querySelector("#profileInput");
 const saveProfileButton = document.querySelector("#saveProfileButton");
 const timelineOutput = document.querySelector("#timelineOutput");
+const gestureCoachElement = document.querySelector("#gestureCoach");
+const coachClose = document.querySelector("#coachClose");
+const replayHelpButton = document.querySelector("#replayHelpButton");
+const calibrationReference = document.querySelector("#calibrationReference");
+const calibrationUnit = document.querySelector("#calibrationUnit");
+const calibrationWidth = document.querySelector("#calibrationWidth");
+const applyCalibrationButton = document.querySelector("#applyCalibrationButton");
+const calibrationOutput = document.querySelector("#calibrationOutput");
 const grid = document.querySelector("#grid");
 const emptyState = document.querySelector("#emptyState");
 const layerCard = document.querySelector("#layerCard");
@@ -79,6 +95,12 @@ let comparing = false;
 let perspectiveActive = false;
 let activePerspectiveQuad = null;
 let perspectiveDragIndex = null;
+let currentProjectId = null;
+let cameraFacing = globalThis.localStorage?.getItem("tracelens-camera-facing") || "environment";
+let gestureFrame = 0;
+let physicalCalibration = null;
+let lastTapAt = 0;
+let longPressTimer = null;
 const vision = new VisionUtils();
 const perspectiveSolver = new PerspectiveSolver();
 const snapController = new OverlaySnapController(perspectiveOverlay);
@@ -89,6 +111,7 @@ const guides = new MeasurementGuides(measurementGuides);
 const diagnostics = new Diagnostics(diagnosticsOutput);
 const calibrationProfiles = new CalibrationProfiles();
 const timeline = new SessionTimeline();
+const gestureCoach = new GestureCoach(gestureCoachElement, { reducedMotion: typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches });
 const adaptiveOpacity = new AdaptiveOpacityController({ analyzer: vision, onOpacity: (value, metrics) => { opacity = value; opacityInput.value = value; renderOverlay(); perspectiveOverlay.style.opacity = value; } });
 const surfaceTracker = new SurfaceTracker({ onUpdate: result => {
   if (!workspaceImage) return;
@@ -115,11 +138,12 @@ function renderOverlay() {
   applyBlendMode(perspectiveOverlay, blendModeInput.value);
 }
 
-function captureState() { return { x, y, scale, rotation, opacity, flipped, blendMode: blendModeInput.value, guide: guideInput.value }; }
+function captureState() { return { x, y, scale, rotation, opacity, flipped, blendMode: blendModeInput.value, guide: guideInput.value, physicalCalibration }; }
 function applyState(next) {
   if (!next) return;
   x = Number(next.x) || 0; y = Number(next.y) || 0; scale = Number(next.scale) || 1; rotation = Number(next.rotation) || 0; opacity = Number(next.opacity) || .55; flipped = Boolean(next.flipped);
   blendModeInput.value = next.blendMode || "Normal"; guideInput.value = next.guide || "none"; guides.setMode(guideInput.value);
+  physicalCalibration = next.physicalCalibration || null;
   opacityInput.value = opacity; scaleInput.value = scale; rotationInput.value = rotation; renderOverlay();
 }
 function pushHistory() { if (workspaceImage) history.push(captureState()); }
@@ -127,11 +151,22 @@ function addTimeline(type, detail = "") { timeline.add(type, detail); const late
 function applyLocks(saved = {}) { Object.keys(locks).forEach(key => { if (typeof locks[key] === "boolean") locks[key] = Boolean(saved[key]); const input = document.querySelector(`[data-lock="${key}"]`); if (input) input.checked = locks[key]; }); stage.classList.toggle("locked", locks.position); layerLock.textContent = locks.position ? "♙" : "♧"; }
 function applyProject(project) {
   if (!project?.image) return;
-  workspaceImage = project.image; overlay.src = workspaceImage; layerThumb.src = workspaceImage; layerName.textContent = project.name || "Reference image"; projectNameInput.value = project.name || "Untitled project"; overlay.style.display = "block"; overlay.hidden = false; emptyState.style.display = "none"; layerCard.hidden = false; selectionFrame.classList.add("visible"); showOverlayTools();
+  currentProjectId = project.id || null; workspaceImage = project.image; overlay.src = workspaceImage; layerThumb.src = workspaceImage; layerName.textContent = project.name || "Reference image"; projectNameInput.value = project.name || "Untitled project"; overlay.style.display = "block"; overlay.hidden = false; emptyState.style.display = "none"; layerCard.hidden = false; selectionFrame.classList.add("visible"); showOverlayTools();
   if (project.preset) { presetInput.value = project.preset; applyPreset(project.preset, false); } applyState(project); applyLocks(project.locks); pushHistory(); surfaceTracker.start(camera);
 }
-async function refreshProjectList() { try { const projects = await projectLibrary.all(); projectList.replaceChildren(new Option("Projects", ""), ...projects.map(project => new Option(`${project.name} · ${new Date(project.updatedAt).toLocaleDateString()}`, project.id))); } catch (error) { console.warn("Could not list projects", error); } }
+async function refreshProjectList() { try { let projects = await projectLibrary.all(); const query = projectSearchInput.value.trim().toLowerCase(); if (query) projects = projects.filter(project => project.name.toLowerCase().includes(query) || (project.preset || "").toLowerCase().includes(query)); const sort = projectSortInput.value; projects.sort((a, b) => sort === "name" ? a.name.localeCompare(b.name) : sort === "created" ? b.createdAt - a.createdAt : sort === "favorite" ? Number(b.favorite) - Number(a.favorite) || b.updatedAt - a.updatedAt : b.updatedAt - a.updatedAt); projectList.replaceChildren(new Option(projects.length ? "Projects" : "No projects yet", ""), ...projects.map(project => new Option(`${project.favorite ? "★ " : ""}${project.name} · ${new Date(project.updatedAt).toLocaleDateString()}`, project.id))); } catch (error) { console.error("[TraceLens projects] list failed", error); status.textContent = "Project storage is unavailable."; } }
 function applyPreset(name, announce = true) { const preset = getWorkflowPreset(name); opacity = preset.opacity; opacityInput.value = opacity; blendModeInput.value = preset.blendMode; guideInput.value = preset.guide; guides.setMode(preset.guide); grid.style.backgroundSize = `${100 / preset.gridSpacing}% ${100 / preset.gridSpacing}%`; surfaceTracker.state.weakAt = preset.tracking.weakAt; surfaceTracker.state.lostAt = preset.tracking.lostAt; renderOverlay(); if (announce) { status.textContent = `${name} workspace active.`; addTimeline("Preset", name); } }
+function applyPhysicalCalibration() {
+  const reference = CALIBRATION_REFERENCES[calibrationReference.value];
+  const desired = Number(calibrationWidth.value);
+  const quad = activePerspectiveQuad || [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }];
+  try {
+    physicalCalibration = { reference: calibrationReference.value, unit: calibrationUnit.value, ...calculateCalibration({ referenceWidth: reference.width, referenceHeight: reference.height, quad, desiredWidth: desired, unit: calibrationUnit.value }) };
+    scale = Math.max(.25, Math.min(3, desired / fromMillimeters(reference.width, calibrationUnit.value)));
+    scaleInput.value = scale; renderOverlay(); pushHistory(); calibrationOutput.textContent = `Estimated ${fromMillimeters(physicalCalibration.desiredWidthMm, calibrationUnit.value).toFixed(1)} ${calibrationUnit.value} wide · ${fromMillimeters(physicalCalibration.desiredHeightMm, calibrationUnit.value).toFixed(1)} high. Approximate only.`; addTimeline("Calibrated", calibrationReference.value);
+  } catch (error) { calibrationOutput.textContent = error.message; }
+}
+function wakeHUD() { stage.classList.remove("hud-idle"); window.clearTimeout(gestureFrame); gestureFrame = window.setTimeout(() => { if (!adjustSheet.classList.contains("open")) stage.classList.add("hud-idle"); }, 2200); }
 
 function showOverlayTools() {
   overlayTools.forEach(tool => tool.classList.add("available"));
@@ -151,7 +186,8 @@ function saveWorkspace() {
 async function saveProject() {
   if (!workspaceImage) { status.textContent = "Import an image before saving a project."; return; }
   const name = projectNameInput.value.trim() || "Untitled project";
-  await projectLibrary.put({ id: `${name}-${Date.now()}`, name, image: workspaceImage, preset: presetInput.value, perspective: activePerspectiveQuad, ...captureState(), locks: { ...locks }, updatedAt: Date.now(), thumbnail: workspaceImage });
+  currentProjectId ||= globalThis.crypto?.randomUUID?.() || `project-${Date.now()}`;
+  await projectLibrary.put({ id: currentProjectId, name, image: workspaceImage, preset: presetInput.value, perspective: activePerspectiveQuad, ...captureState(), locks: { ...locks }, updatedAt: Date.now(), thumbnail: await projectLibrary.thumbnail(workspaceImage) });
   await refreshProjectList(); addTimeline("Saved", name);
   status.textContent = `Project “${name}” saved.`;
 }
@@ -168,13 +204,13 @@ function restoreWorkspace() {
     workspaceImage = saved.image;
     x = Number(saved.x) || 0; y = Number(saved.y) || 0; scale = Number(saved.scale) || 1;
     rotation = Number(saved.rotation) || 0; opacity = Number(saved.opacity) || .55; flipped = Boolean(saved.flipped);
-    overlay.src = workspaceImage; layerThumb.src = workspaceImage; layerName.textContent = "Saved workspace";
+    currentProjectId = null; overlay.src = workspaceImage; layerThumb.src = workspaceImage; layerName.textContent = "Saved workspace";
     overlay.style.display = "block"; emptyState.style.display = "none"; layerCard.hidden = false; selectionFrame.classList.add("visible");
     showOverlayTools(); opacityInput.value = opacity; scaleInput.value = scale; rotationInput.value = rotation;
     applyState(saved); status.textContent = "Saved workspace restored.";
     addTimeline("Restored", "Workspace");
     pushHistory();
-    surfaceTracker.start(camera);
+    if (workspaceImage) surfaceTracker.start(camera);
   } catch (error) { console.warn("Could not restore workspace", error); }
 }
 
@@ -182,15 +218,17 @@ async function startCamera() {
   try {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera access is not supported.");
     if (stream) stream.getTracks().forEach(track => track.stop());
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: cameraFacing } }, audio: false });
     camera.srcObject = stream;
+    camera.classList.toggle("selfie-camera", cameraFacing === "user");
     cameraState.textContent = "CAMERA ACTIVE";
     status.textContent = "Camera active.";
-    surfaceTracker.start(camera);
+    if (workspaceImage) surfaceTracker.start(camera);
   } catch (error) {
     cameraState.textContent = "CAMERA UNAVAILABLE";
-    status.textContent = "Camera blocked. Allow access from the secure link.";
-    console.error(error);
+    const name = error?.name;
+    const message = name === "NotAllowedError" ? "Camera permission denied. Allow access or use Import." : name === "NotFoundError" ? "No camera found. Import an image instead." : name === "NotReadableError" ? "Camera is busy in another app. Retry when available." : window.isSecureContext === false ? "Camera requires an HTTPS page." : "Camera could not start. Retry or import an image.";
+    status.textContent = message; console.error("[TraceLens camera]", name || "unknown", error);
   }
 }
 
@@ -213,7 +251,7 @@ function loadImage(file) {
     showOverlayTools();
     pushHistory();
     gestureHint.hidden = false;
-    addTimeline("Imported", file.name);
+    addTimeline("Imported", file.name); gestureCoach.show();
     status.textContent = "Overlay loaded. Drag, pinch, or rotate to position it.";
     surfaceTracker.start(camera);
   };
@@ -227,14 +265,23 @@ opacityInput.addEventListener("input", event => { opacity = Number(event.target.
 scaleInput.addEventListener("input", event => { if (!locks.canEdit("scale")) return; scale = Number(event.target.value); renderOverlay(); });
 rotationInput.addEventListener("input", event => { if (!locks.canEdit("rotation")) return; rotation = Number(event.target.value); renderOverlay(); });
 cameraButton.addEventListener("click", startCamera);
+cameraFacingButton?.addEventListener("click", () => { cameraFacing = cameraFacing === "environment" ? "user" : "environment"; globalThis.localStorage?.setItem("tracelens-camera-facing", cameraFacing); startCamera(); });
 gridButton.addEventListener("click", () => { grid.classList.toggle("visible"); gridButton.classList.toggle("active"); });
 flipButton.addEventListener("click", () => { flipped = !flipped; flipButton.classList.toggle("active", flipped); renderOverlay(); });
-adjustButton.addEventListener("click", () => { adjustSheet.classList.toggle("open"); adjustSheet.setAttribute("aria-hidden", !adjustSheet.classList.contains("open")); });
+adjustButton.addEventListener("click", () => { adjustSheet.classList.toggle("open"); adjustSheet.setAttribute("aria-hidden", !adjustSheet.classList.contains("open")); stage.classList.toggle("adjust-open", adjustSheet.classList.contains("open")); });
+closeAdjust.addEventListener("click", () => { adjustSheet.classList.remove("open"); adjustSheet.setAttribute("aria-hidden", "true"); stage.classList.remove("adjust-open"); });
+replayHelpButton.addEventListener("click", () => gestureCoach.replay());
+coachClose.addEventListener("click", () => gestureCoach.dismiss());
+applyCalibrationButton.addEventListener("click", applyPhysicalCalibration);
 workspaceButton.addEventListener("click", saveWorkspace);
 presetInput.addEventListener("change", event => applyPreset(event.target.value));
+projectSearchInput.addEventListener("input", refreshProjectList);
+projectSortInput.addEventListener("change", refreshProjectList);
 saveProjectButton.addEventListener("click", () => { saveProject().catch(error => { status.textContent = "Project storage unavailable."; console.warn(error); }); });
 loadProjectButton.addEventListener("click", async () => { const project = await projectLibrary.get(projectList.value); if (project) { applyProject(project); addTimeline("Loaded", project.name); status.textContent = `Project “${project.name}” loaded.`; } });
-deleteProjectButton.addEventListener("click", async () => { if (!projectList.value) return; await projectLibrary.remove(projectList.value); await refreshProjectList(); status.textContent = "Project archived from this device."; });
+duplicateProjectButton.addEventListener("click", async () => { const project = await projectLibrary.get(projectList.value); if (!project) return; currentProjectId = globalThis.crypto?.randomUUID?.() || `project-${Date.now()}`; projectNameInput.value = `${project.name} copy`; await saveProject(); await refreshProjectList(); });
+favoriteProjectButton.addEventListener("click", async () => { if (!projectList.value) return; const project = await projectLibrary.get(projectList.value); if (project) { await projectLibrary.patch(project.id, { favorite: !project.favorite }); await refreshProjectList(); } });
+deleteProjectButton.addEventListener("click", async () => { if (!projectList.value) return; if (window.confirm("Archive this project?")) { await projectLibrary.patch(projectList.value, { archived: true }); await refreshProjectList(); status.textContent = "Project archived on this device."; } });
 exportProjectButton.addEventListener("click", async () => { if (!projectList.value) { status.textContent = "Select a project to export."; return; } const project = await projectLibrary.get(projectList.value); if (project) { downloadProjectBundle(createProjectBundle(project), `${project.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}.json`); addTimeline("Exported", project.name); } });
 importProjectInput.addEventListener("change", event => { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = async () => { try { const bundle = JSON.parse(reader.result); if (!validateProjectBundle(bundle)) throw new Error("Unsupported project bundle"); const project = { ...bundle.project, id: `${bundle.project.name || "Imported project"}-${Date.now()}`, updatedAt: Date.now() }; await projectLibrary.put(project); applyProject(project); await refreshProjectList(); addTimeline("Imported", project.name); status.textContent = `Project “${project.name}” imported.`; } catch (error) { status.textContent = "That project bundle is not compatible."; console.warn(error); } }; reader.readAsText(file); });
 saveProfileButton.addEventListener("click", () => { calibrationProfiles.save(profileInput.value, { preset: presetInput.value, perspective: activePerspectiveQuad, state: captureState(), locks: { ...locks } }); status.textContent = `Calibration “${profileInput.value}” saved.`; });
@@ -253,7 +300,6 @@ autoPerspectiveButton.addEventListener("click", () => {
   snapController.snap(workspaceImage, quad, stage.clientWidth, stage.clientHeight, opacity);
   activePerspectiveQuad = result.quad.map(point => ({ ...point })); perspectiveActive = true; surfaceTracker.lock(); overlay.style.display = "none"; selectionFrame.classList.add("surface-found"); selectionFrame.style.clipPath = `polygon(${result.quad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; status.textContent = "Perspective Locked."; visionStatus.textContent = `Tracking · ${result.confidence}% · Stable`; addTimeline("Perspective Locked");
 });
-closeAdjust.addEventListener("click", () => { adjustSheet.classList.remove("open"); adjustSheet.setAttribute("aria-hidden", "true"); });
 layerVisibility.addEventListener("click", () => { overlay.hidden = !overlay.hidden; layerVisibility.textContent = overlay.hidden ? "⊘" : "◉"; });
 layerLock.addEventListener("click", () => { locks.toggle("position"); stage.classList.toggle("locked", locks.position); layerLock.textContent = locks.position ? "♙" : "♧"; });
 resetButton.addEventListener("click", () => { x = 0; y = 0; scale = 1; rotation = 0; opacity = 0.55; flipped = false; opacityInput.value = opacity; scaleInput.value = scale; rotationInput.value = rotation; renderOverlay(); flipButton.classList.remove("active"); status.textContent = "Overlay position reset."; });
@@ -274,6 +320,11 @@ function distance(a, b) { return Math.hypot(a.clientX - b.clientX, a.clientY - b
 function angle(a, b) { return Math.atan2(b.clientY - a.clientY, b.clientX - a.clientX) * 180 / Math.PI; }
 stage.addEventListener("pointerdown", event => {
   if (!overlay.src || stage.classList.contains("locked")) return;
+  wakeHUD(); gestureCoach.dismiss();
+  const now = performance.now();
+  if (now - lastTapAt < 320) { x = 0; y = 0; renderOverlay(); status.textContent = "Overlay centered."; }
+  lastTapAt = now;
+  window.clearTimeout(longPressTimer); longPressTimer = window.setTimeout(() => { locks.toggle("position"); stage.classList.toggle("locked", locks.position); layerLock.textContent = locks.position ? "♙" : "♧"; status.textContent = locks.position ? "Overlay locked." : "Overlay unlocked."; }, 650);
   const handle = event.target.closest?.(".selection-frame i");
   if (perspectiveActive && handle && locks.canEdit("perspective")) { perspectiveDragIndex = [...selectionFrame.querySelectorAll("i")].indexOf(handle); stage.setPointerCapture(event.pointerId); return; }
   if (!locks.canEdit("position")) return;
@@ -290,7 +341,12 @@ stage.addEventListener("pointermove", event => {
 });
 function endPointer(event) { perspectiveDragIndex = null; pointers.delete(event.pointerId); if (stage.hasPointerCapture(event.pointerId)) stage.releasePointerCapture(event.pointerId); if (pointers.size < 2) gestureStart = null; dragging = pointers.size === 1; }
 stage.addEventListener("pointerup", endPointer); stage.addEventListener("pointercancel", endPointer);
-function requestVisionFrame(now = performance.now()) { diagnostics.frame(); adaptiveOpacity.update(camera, now); diagnostics.render({ tracking: surfaceTracker.state.confidence, camera: camera.videoWidth ? `${camera.videoWidth}×${camera.videoHeight}` : "—", quality: perspectiveActive ? "perspective" : "high" }); requestAnimationFrame(requestVisionFrame); }
+stage.addEventListener("pointerup", () => window.clearTimeout(longPressTimer));
+stage.addEventListener("pointercancel", () => { window.clearTimeout(longPressTimer); pointers.clear(); gestureStart = null; dragging = false; });
+window.addEventListener("blur", () => { window.clearTimeout(longPressTimer); pointers.clear(); gestureStart = null; dragging = false; });
+document.addEventListener("visibilitychange", () => { if (document.hidden) { surfaceTracker.stop(); } else if (camera.srcObject && workspaceImage) surfaceTracker.start(camera); });
+window.addEventListener("keydown", event => { if (event.key === "Escape" && adjustSheet.classList.contains("open")) { closeAdjust.click(); } });
+function requestVisionFrame(now = performance.now()) { diagnostics.frame(); if (workspaceImage && !document.hidden) adaptiveOpacity.update(camera, now); diagnostics.render({ tracking: surfaceTracker.state.confidence, camera: camera.videoWidth ? `${camera.videoWidth}×${camera.videoHeight}` : "—", quality: perspectiveActive ? "perspective" : "high" }); requestAnimationFrame(requestVisionFrame); }
 
 function initializeCoreUI() {
   const required = { stage, camera, cameraState, status, imageInput, dockImageInput, cameraButton };
@@ -327,6 +383,7 @@ try {
   initializeImageImport();
   initializeCamera();
   initializeOptionalSystems();
+  registerPWA({ onUpdate: () => status.textContent = "Update available. Reload when ready." });
   requestVisionFrame();
 } catch (error) {
   console.error("[TraceLens core] initialization failed", error);

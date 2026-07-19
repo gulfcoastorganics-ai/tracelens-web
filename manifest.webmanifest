@@ -1,0 +1,10 @@
+{
+  "name": "TraceLens",
+  "short_name": "TraceLens",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#090a0c",
+  "theme_color": "#090a0c",
+  "description": "Camera-first creative alignment tool"
+}
