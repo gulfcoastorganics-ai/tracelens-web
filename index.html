@@ -23,6 +23,7 @@
       <video id="camera" autoplay playsinline muted></video>
       <img id="overlay" alt="Reference overlay" />
       <canvas id="perspectiveOverlay" aria-hidden="true" hidden></canvas>
+      <div class="measurement-guides" id="measurementGuides" aria-hidden="true"></div>
       <div class="selection-frame" id="selectionFrame" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
       <div class="grid" id="grid"></div>
       <div class="reticle" aria-hidden="true"><i></i><i></i><i></i><i></i><span></span></div>
@@ -57,11 +58,20 @@
     <section class="control-area">
       <div class="adjust-sheet" id="adjustSheet" aria-hidden="true">
         <div class="sheet-heading"><div><span class="eyebrow">PRECISION</span><h2>Adjust overlay</h2></div><button class="close-button" id="closeAdjust" aria-label="Close adjust panel">×</button></div>
+        <div class="feature-row workflow-row"><label class="select-control">Workspace <select id="presetInput"><option>Artist</option><option>Mural</option><option>Tattoo</option><option>Blueprint</option><option>Sign &amp; Vinyl</option><option>Photography</option><option>Custom</option></select></label></div>
         <label class="slider"><span>Opacity <output id="opacityOutput">55%</output></span><input id="opacityInput" type="range" min="0.05" max="1" step="0.05" value="0.55" /></label>
         <label class="slider"><span>Scale <output id="scaleOutput">100%</output></span><input id="scaleInput" type="range" min="0.25" max="3" step="0.05" value="1" /></label>
         <label class="slider"><span>Rotation <output id="rotationOutput">0°</output></span><input id="rotationInput" type="range" min="-180" max="180" step="1" value="0" /></label>
         <div class="feature-row"><button class="feature-button" id="autoPerspectiveButton">⌁ Auto Perspective</button><label class="toggle-control"><input id="autoOpacityInput" type="checkbox" /><span class="toggle-track"></span><span>Auto Opacity</span></label></div>
+        <div class="feature-row lock-row"><span class="feature-label">Locks</span><label class="lock-control"><input data-lock="position" type="checkbox" /> Position</label><label class="lock-control"><input data-lock="rotation" type="checkbox" /> Rotation</label><label class="lock-control"><input data-lock="scale" type="checkbox" /> Scale</label><label class="lock-control"><input data-lock="perspective" type="checkbox" /> Perspective</label></div>
+        <div class="feature-row"><label class="select-control">Blend <select id="blendModeInput"><option>Normal</option><option>Multiply</option><option>Screen</option><option>Overlay</option><option>Darken</option><option>Lighten</option><option>Difference</option></select></label><label class="select-control">Guides <select id="guideInput"><option value="none">None</option><option value="center">Center</option><option value="thirds">Thirds</option><option value="golden">Golden ratio</option><option value="square">Square grid</option></select></label></div>
+        <div class="feature-row project-row"><input class="project-name" id="projectNameInput" value="Untitled project" maxlength="40" aria-label="Project name" /><button class="feature-button" id="saveProjectButton">Save project</button><button class="feature-button" id="undoButton">Undo</button><button class="feature-button" id="redoButton">Redo</button></div>
+        <div class="feature-row project-row"><select class="project-list" id="projectList" aria-label="Saved projects"><option value="">Projects</option></select><button class="feature-button" id="loadProjectButton">Load</button><button class="feature-button" id="deleteProjectButton">Delete</button><button class="feature-button" id="exportProjectButton">Export</button><label class="feature-button import-project">Import<input id="importProjectInput" type="file" accept="application/json,.json" /></label></div>
+        <div class="feature-row project-row"><select class="project-list" id="profileInput" aria-label="Calibration profile"><option>Living Room Wall</option><option>Garage Door</option><option>Tattoo Chair</option><option>Canvas Stand</option><option>Workshop Table</option></select><button class="feature-button" id="saveProfileButton">Save calibration</button></div>
+        <p class="timeline-output" id="timelineOutput" aria-live="polite">Session ready.</p>
+        <label class="toggle-control diagnostics-toggle"><input id="diagnosticsInput" type="checkbox" /><span class="toggle-track"></span><span>Developer Mode</span></label>
         <p class="vision-status" id="visionStatus" aria-live="polite">Surface tools are ready.</p>
+        <p class="diagnostics-output" id="diagnosticsOutput" hidden></p>
       </div>
 
       <nav class="dock" aria-label="TraceLens tools">
