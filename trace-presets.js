@@ -2,7 +2,7 @@ const clamp01 = value => Math.max(0, Math.min(1, Number.isFinite(Number(value)) 
 
 export const TRACE_PRESETS = Object.freeze({
   "Clean Contour": { blur: 1, contrast: 1.2, threshold: .42, edgeOperator: "sobel", morphology: 1, minComponent: .0008, simplification: .04, lineWeight: "Uniform", zones: 0, backgroundSuppression: .15 },
-  "Pencil Sketch": { blur: 1, contrast: 1.05, threshold: .24, edgeOperator: "sobel", morphology: 0, minComponent: .0002, simplification: .01, lineWeight: "Expressive", zones: 0, backgroundSuppression: 0 },
+  "Pencil Sketch": { blur: 2, contrast: 1.08, threshold: .3, edgeOperator: "sobel", morphology: 1, minComponent: .0005, simplification: .02, lineWeight: "Structural", priority: .48, zones: 0, backgroundSuppression: .08 },
   "Technical Outline": { blur: 1, contrast: 1.3, threshold: .5, edgeOperator: "sobel", morphology: 1, minComponent: .0012, simplification: .06, lineWeight: "Structural", zones: 0, backgroundSuppression: .3 },
   "Shadow Blocks": { blur: 2, contrast: 1.25, threshold: .5, edgeOperator: "sobel", morphology: 1, minComponent: .001, simplification: .05, lineWeight: "Structural", zones: 5, backgroundSuppression: .1 },
   "High-Contrast Stencil": { blur: 2, contrast: 1.5, threshold: .52, edgeOperator: "sobel", morphology: 2, minComponent: .002, simplification: .08, lineWeight: "Uniform", zones: 3, backgroundSuppression: .35 },
@@ -27,7 +27,7 @@ export function normalizeTraceSettings(settings = {}) {
   const requestedMode = TRACE_MODES.includes(settings.mode) ? settings.mode : "Clean Lines";
   const preset = TRACE_PRESETS[requestedMode] || TRACE_PRESETS["Clean Lines"];
   const detail = clamp01(settings.detail ?? settings.strength ?? .55);
-  const priority = clamp01(settings.priority ?? settings.coreLines ?? .6);
+  const priority = clamp01(settings.priority ?? settings.coreLines ?? preset.priority ?? .6);
   const zones = Math.max(0, Math.min(8, Math.round(Number(settings.levels ?? settings.zones ?? preset.zones) || 0)));
   return { ...preset, ...settings, mode: requestedMode, detail, priority, strength: detail, threshold: clamp01(settings.threshold ?? preset.threshold), blur: Math.max(0, Math.min(6, Number(settings.blur ?? preset.blur) || 0)), contrast: Math.max(.1, Math.min(3, Number(settings.contrast ?? preset.contrast) || 1)), levels: zones, lineWeight: ["Uniform", "Structural", "Expressive"].includes(settings.lineWeight) ? settings.lineWeight : preset.lineWeight, isolation: settings.isolation === true, preview: settings.preview === true };
 }

@@ -237,6 +237,16 @@ function updateContext() {
   updatePresetChips();
 }
 
+function organizeTraceControls() {
+  const panel = document.querySelector("#traceAssistPanel"); const advanced = document.querySelector("#traceAdvanced"); const modeRow = traceModeInput?.closest(".trace-mode-row"); if (!panel || !advanced || !modeRow || panel.dataset.organized === "true") return;
+  const section = (title, open = false) => { const details = document.createElement("details"); details.className = "trace-control-section"; details.open = open; const summary = document.createElement("summary"); summary.textContent = title; details.append(summary); return details; };
+  const basic = section("Basic", true); const advancedSection = section("Advanced"); const creative = section("Creative"); const diagnosticsSection = section("Diagnostics");
+  const labelFor = input => input?.closest("label"); basic.append(modeRow, labelFor(traceDetailInput), labelFor(tracePriorityInput));
+  advancedSection.append(labelFor(traceThresholdInput), labelFor(traceBlurInput), labelFor(traceLineWeightInput));
+  creative.append(labelFor(traceLevelsInput), labelFor(traceIsolationInput), labelFor(traceBackgroundInput), labelFor(traceStageInput), traceFocusShapeInput?.closest(".trace-focus-row"));
+  advanced.replaceChildren(advancedSection, creative); if (traceQuality) diagnosticsSection.append(traceQuality); panel.append(basic, advanced, diagnosticsSection); panel.dataset.organized = "true";
+}
+
 function perspectiveFeedback(result = {}) {
   const reason = result.rejection || result.metrics?.reason;
   if (reason === "edge-of-frame") return "Too close to frame edge";
@@ -661,6 +671,7 @@ function initializeCoreUI() {
   const missing = Object.entries(required).filter(([, element]) => !element).map(([name]) => name);
   if (missing.length) throw new Error(`TraceLens core UI missing: ${missing.join(", ")}`);
   if (gestureHint) gestureHint.hidden = true;
+  organizeTraceControls();
   renderOverlay();
   updateContext();
 }

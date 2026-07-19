@@ -45,4 +45,5 @@ assert.match(app, /processPreview/);
 assert.match(app, /normalizeTraceSettings/);
 assert.match(app, /TraceGuideController/);
 assert.match(app, /traceGuideOverlay/);
+assert.match(app, /organizeTraceControls/);
 console.log("release core tests passed");

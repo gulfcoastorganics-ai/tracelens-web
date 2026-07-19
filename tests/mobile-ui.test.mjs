@@ -10,6 +10,7 @@ for (const id of ["quickTraceBar", "quickOriginalButton", "quickAssistButton", "
 assert.match(css, /100dvh|--app-viewport-height/);
 assert.match(css, /safe-area-inset-bottom/);
 assert.match(css, /trace-mode-chips/);
+assert.match(css, /trace-control-section/);
 assert.match(app, /layersExpanded = false/);
 assert.match(app, /adjustSheet\.dataset\.state = nextState/);
 console.log("mobile UI static checks passed");
