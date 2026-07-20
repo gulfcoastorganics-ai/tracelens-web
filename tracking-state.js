@@ -1,9 +1,15 @@
+/**
+ * Temporal interpretation of detector confidence.
+ * Confidence is numeric input; state is the user-facing stability contract.
+ * The grace period prevents one bad frame from making an overlay jump.
+ */
 export class TrackingState {
   constructor({ acquireAt = 78, retainAt = 55, lostAt = 35, graceMs = 1200 } = {}) {
     this.state = "searching"; this.confidence = 0; this.lastSeen = 0;
     this.acquireAt = acquireAt; this.retainAt = retainAt; this.lostAt = lostAt; this.graceMs = graceMs;
   }
 
+  /** Update confidence and return the derived tracking state. */
   update(confidence, now = performance.now(), locked = false) {
     this.confidence = Math.round(confidence || 0);
     const threshold = locked ? this.retainAt : this.acquireAt;
@@ -15,5 +21,6 @@ export class TrackingState {
     return { state: this.state, confidence: this.confidence };
   }
 
+  /** Return to an unlocked search state without changing configured thresholds. */
   reset() { this.state = "searching"; this.confidence = 0; this.lastSeen = 0; }
 }

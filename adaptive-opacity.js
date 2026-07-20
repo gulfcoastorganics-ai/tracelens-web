@@ -1,6 +1,8 @@
+/** Adjust overlay opacity slowly from camera luminance so the reference stays legible. */
 export class AdaptiveOpacityController {
   constructor({ analyzer, onOpacity } = {}) { this.analyzer = analyzer; this.onOpacity = onOpacity; this.enabled = false; this.lastRun = 0; this.value = 0.55; }
   setEnabled(enabled) { this.enabled = enabled; }
+  /** Sample at most once per cadence window and ease toward the computed target. */
   update(video, now = performance.now()) {
     if (!this.enabled || now - this.lastRun < 220) return;
     this.lastRun = now;

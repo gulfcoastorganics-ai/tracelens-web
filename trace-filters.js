@@ -1,3 +1,4 @@
+/** Pure RGBA filters shared by the worker and main-thread fallback. */
 import { getTraceStage } from "./trace-stages.js";
 import { detailMapping, normalizeTraceSettings } from "./trace-presets.js";
 import { applyTraceMask } from "./trace-analysis.js";
@@ -43,6 +44,7 @@ export function posterize(image, levels = 5) {
   return { data: output, width: source.width, height: source.height };
 }
 
+/** Compose normalized settings into a new processed image without mutating input. */
 export function composeTrace(image, settings = {}) {
   const normalized = normalizeTraceSettings(settings); const mode = normalized.mode; if (mode === "Original") return image;
   const stage = getTraceStage(normalized.stage); const mapping = detailMapping(normalized); const contrast = normalized.contrast; const blur = normalized.blur + stage.blur + normalized.morphology * .25; const level = clamp(mapping.edgeThreshold + stage.thresholdBias, .03, .95); const invert = Boolean(normalized.invert || mode === "Inverted Lines");

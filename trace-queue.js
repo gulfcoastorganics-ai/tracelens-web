@@ -1,3 +1,4 @@
+/** Serial async queue for trace jobs; callers decide debounce/cancellation policy. */
 export function createTraceQueue({ process, onError } = {}) {
   let generation = 0;
   let running = false;

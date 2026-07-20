@@ -27,6 +27,33 @@ export function scoreTraceQuality(image, components = [], { sourceBlur = 0, nois
   return { score: Math.max(0, Math.min(100, score)), density, variance, transitionRatio, componentCount: components.length, averageComponentSize, fragmentRatio, warnings, suggestions, status: score >= 70 && !warnings.length ? "Good trace" : score >= 40 ? "Trace can be improved" : "Weak trace" };
 }
 
+// Compact, presentation-ready metrics for the tracing UI. Keep this separate
+// from quality scoring so changing a warning threshold never changes what a
+// creator sees as the amount of work in a trace.
+export function summarizeTrace(result = {}) {
+  const width = Math.max(1, Number(result.width) || 1);
+  const height = Math.max(1, Number(result.height) || 1);
+  const lines = Array.isArray(result.lines) ? result.lines : [];
+  const contours = Array.isArray(result.contours) ? result.contours : lines;
+  const length = lines.reduce((total, line) => {
+    const points = Array.isArray(line?.points) ? line.points : [];
+    return total + points.slice(1).reduce((sum, point, index) => {
+      const previous = points[index];
+      const x = Number(point?.x), y = Number(point?.y), previousX = Number(previous?.x), previousY = Number(previous?.y);
+      // Do not allow malformed optional points to poison all displayed stats.
+      return sum + (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(previousX) && Number.isFinite(previousY) ? Math.hypot(x - previousX, y - previousY) : 0);
+    }, 0);
+  }, 0);
+  const finiteLength = Number.isFinite(length) ? length : 0;
+  return {
+    contourCount: contours.length,
+    lineCount: lines.length,
+    totalLength: Math.round(finiteLength),
+    coverage: Math.min(1, finiteLength / Math.max(1, width * height * .08)),
+    quality: Math.max(0, Math.min(100, Math.round(Number(result.quality?.score) || 0)))
+  };
+}
+
 export function generateValueZones(image, levels = 5) {
   const count = Math.max(3, Math.min(8, Math.round(Number(levels) || 5))); const output = new Uint8Array(image.width * image.height); for (let i = 0; i < output.length; i += 1) output[i] = Math.min(count - 1, Math.floor((image.data[i * 4] / 256) * count)); return { levels: count, data: output, width: image.width, height: image.height };
 }

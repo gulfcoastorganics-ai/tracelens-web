@@ -17,6 +17,7 @@ export class OverlaySnapController {
   drawTriangle(image, sx0, sy0, sx1, sy1, sx2, sy2, d0, d1, d2) {
     const context = this.context;
     const denominator = sx0 * (sy1 - sy2) + sx1 * (sy2 - sy0) + sx2 * (sy0 - sy1);
+    if (!Number.isFinite(denominator) || Math.abs(denominator) < Number.EPSILON) return false;
     const a = (d0.x * (sy1 - sy2) + d1.x * (sy2 - sy0) + d2.x * (sy0 - sy1)) / denominator;
     const c = (d0.x * (sx2 - sx1) + d1.x * (sx0 - sx2) + d2.x * (sx1 - sx0)) / denominator;
     const e = d0.x - a * sx0 - c * sy0;
@@ -24,6 +25,7 @@ export class OverlaySnapController {
     const d = (d0.y * (sx2 - sx1) + d1.y * (sx0 - sx2) + d2.y * (sx1 - sx0)) / denominator;
     const f = d0.y - b * sx0 - d * sy0;
     context.save(); context.beginPath(); context.moveTo(d0.x, d0.y); context.lineTo(d1.x, d1.y); context.lineTo(d2.x, d2.y); context.closePath(); context.clip(); context.setTransform(a, b, c, d, e, f); context.drawImage(image, 0, 0); context.restore();
+    return true;
   }
 
   clear() { this.generation += 1; this.sourceKey = null; this.image = null; this.loadPromise = null; this.active = false; this.canvas.hidden = true; this.context.clearRect(0, 0, this.canvas.width, this.canvas.height); }

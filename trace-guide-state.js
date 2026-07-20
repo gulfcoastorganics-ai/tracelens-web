@@ -1,7 +1,9 @@
+/** Serializable Trace Guide state and progress normalization. */
 export const GUIDE_MODES = Object.freeze(["finger", "pinch", "tool"]);
 export const GUIDE_TOLERANCES = Object.freeze({ Precision: 12, Standard: 22, Relaxed: 36 });
 export const DEFAULT_GUIDE_STATE = Object.freeze({ enabled: false, running: false, mode: "finger", tolerance: "Standard", smoothing: "Medium", direction: 1, contourId: null, progressIndex: 0, progress: 0, highestProgress: 0, visited: [], status: "Paused", confidence: 0, deviation: null, lastUpdate: 0 });
 
+/** Return a bounded copy so persisted guide state cannot corrupt the renderer. */
 export function normalizeGuideState(state = {}) { return { enabled: Boolean(state.enabled), running: Boolean(state.running), mode: GUIDE_MODES.includes(state.mode) ? state.mode : "finger", tolerance: GUIDE_TOLERANCES[state.tolerance] ? state.tolerance : "Standard", smoothing: ["Off", "Light", "Medium", "Strong"].includes(state.smoothing) ? state.smoothing : "Medium", direction: state.direction === -1 ? -1 : 1, contourId: state.contourId || null, progressIndex: Math.max(0, Number(state.progressIndex) || 0), progress: Math.max(0, Math.min(1, Number(state.progress) || 0)), highestProgress: Math.max(0, Math.min(1, Number(state.highestProgress) || 0)), visited: Array.isArray(state.visited) ? state.visited.slice(0, 2000) : [], status: typeof state.status === "string" ? state.status : "Paused", confidence: Math.max(0, Math.min(1, Number(state.confidence) || 0)), deviation: Number.isFinite(Number(state.deviation)) ? Number(state.deviation) : null, lastUpdate: Number(state.lastUpdate) || 0 }; }
 
 export function updateGuideProgress(state, nearest, target, { confidence = 0, acquisitionRadius = GUIDE_TOLERANCES[state.tolerance] || 22, completionThreshold = .94 } = {}) {

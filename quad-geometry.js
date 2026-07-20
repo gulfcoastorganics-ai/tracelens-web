@@ -1,3 +1,4 @@
+/** Geometry primitives for normalized four-corner surface validation. */
 export function distance(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
 export function signedArea(quad) { return quad.reduce((sum, point, index) => { const next = quad[(index + 1) % quad.length]; return sum + point.x * next.y - next.x * point.y; }, 0) / 2; }
 export function cross(a, b, c) { return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x); }

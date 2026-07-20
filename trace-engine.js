@@ -1,3 +1,8 @@
+/**
+ * Worker-preferred, cancellable trace pipeline.
+ * Source/result caches are bounded because image buffers are large; request ids
+ * ensure stale work cannot replace the newest control state.
+ */
 import { composeTrace, imageDataToArray } from "./trace-filters.js";
 import { TraceCache, traceCacheKey } from "./trace-cache.js";
 import { findContourComponents } from "./trace-components.js";
@@ -8,14 +13,17 @@ import { rankTraceLines, applyLinePriority, scoreTraceQuality, generateValueZone
 function fingerprint(source) { let hash = 2166136261; const sample = `${source.length}:${source.slice(0, 96)}:${source.slice(-96)}`; for (let i = 0; i < sample.length; i += 1) { hash ^= sample.charCodeAt(i); hash = Math.imul(hash, 16777619); } return (hash >>> 0).toString(16); }
 
 export class TraceEngine {
+  /** Create the processing service and opportunistically start its module worker. */
   constructor({ onStatus, resolution = 640, cacheLimit = 12, sourceCacheEntries = 6, sourceCacheBytes = 24 * 1024 * 1024 } = {}) { this.onStatus = onStatus; this.resolution = resolution; this.cache = new TraceCache(cacheLimit); this.sourceCache = new SourceCache({ maxEntries: sourceCacheEntries, maxBytes: sourceCacheBytes }); this.sources = this.sourceCache; this.worker = null; this.jobs = new Map(); this.lastRequest = 0; this.cancelledJobs = 0; this.staleJobs = 0; this.lastDuration = 0; this.lastPreviewDuration = 0; try { this.worker = new Worker("./trace-worker.js", { type: "module" }); this.worker.onmessage = event => this.resolveWorker(event.data); this.worker.onerror = error => { const pending = [...this.jobs.values()]; this.jobs.clear(); pending.forEach(job => job.reject(new Error(error.message || "Trace worker failed."))); this.worker?.terminate(); this.worker = null; this.onStatus?.({ state: "fallback", detail: error.message || "Worker unavailable" }); }; } catch { this.worker = null; } }
 
+  /** Decode a source into bounded RGBA image data, using the source cache. */
   async decode(source, resolution = this.resolution) {
     const key = `${fingerprint(source)}@${resolution}`; const cached = this.sourceCache.get(key); if (cached) return cached;
     const image = await new Promise((resolve, reject) => { const element = new Image(); element.onload = () => resolve(element); element.onerror = () => reject(new Error("Reference image could not be decoded.")); element.src = source; });
     const ratio = Math.min(1, resolution / Math.max(image.naturalWidth, image.naturalHeight)); const canvas = document.createElement("canvas"); canvas.width = Math.max(1, Math.round(image.naturalWidth * ratio)); canvas.height = Math.max(1, Math.round(image.naturalHeight * ratio)); const context = canvas.getContext("2d", { willReadFrequently: true }); context.drawImage(image, 0, 0, canvas.width, canvas.height); const data = context.getImageData(0, 0, canvas.width, canvas.height); const result = { data: new Uint8ClampedArray(data.data), width: data.width, height: data.height, sourceKey: key }; this.sourceCache.set(key, result, result.data.byteLength); return result;
   }
 
+  /** Process a source; newer requests supersede older requests. */
   async process(source, settings = {}, { preview = false } = {}) {
     const normalized = normalizeTraceSettings({ ...settings, preview }); const resolution = preview ? Math.max(160, Math.min(this.resolution, Math.round(this.resolution * .45))) : this.resolution; const fingerprinted = fingerprint(source); const sourceKey = `${fingerprinted}@${resolution}`; const key = traceCacheKey(fingerprinted, normalized, resolution); const cached = this.cache.get(key); if (cached) return { ...cached, cached: true, key, preview };
     const requestId = ++this.lastRequest; const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now(); this.sourceCache.markActive(sourceKey); this.onStatus?.({ state: "processing", requestId, preview }); let sourceImage;
@@ -27,14 +35,18 @@ export class TraceEngine {
     result.contours = findContourComponents(result, { minSize: Math.max(3, Math.round(result.width * result.height * normalized.minComponent * (1.6 - normalized.detail))) }); result.lines = rankTraceLines(result.contours, { width: result.width, height: result.height, priority: normalized.priority }); if (!normalized.levels && normalized.mode !== "Grayscale") result = applyLinePriority(result, result.lines); result.quality = scoreTraceQuality(result, result.contours); if (normalized.levels) result.zones = generateValueZones(result, normalized.levels); result.stages = generateTraceStages(result, result.contours); const duration = (typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt; this.lastDuration = duration; if (preview) this.lastPreviewDuration = duration; this.cache.set(key, result, result.data.byteLength); this.onStatus?.({ state: "ready", requestId, cached: false, key, preview, duration, contourCount: result.contours.length, quality: result.quality }); return { ...result, cached: false, key, preview, duration };
   }
 
+  /** Convenience preview request using the reduced analysis resolution. */
   processPreview(source, settings = {}) { return this.process(source, settings, { preview: true }); }
-  runWorker(id, image, settings) { return new Promise((resolve, reject) => { this.jobs.set(id, { resolve, reject, cancel: () => resolve({ cancelled: true }) }); const fallback = { ...image, data: new Uint8ClampedArray(image.data) }; try { this.worker.postMessage({ id, image, settings }, [image.data.buffer]); } catch { this.jobs.delete(id); this.worker = null; resolve(composeTrace(fallback, settings)); } }); }
+  runWorker(id, image, settings) { return new Promise((resolve, reject) => { this.jobs.set(id, { resolve, reject, cancel: () => resolve({ cancelled: true }) }); const fallback = { ...image, data: new Uint8ClampedArray(image.data) }; try { this.worker.postMessage({ id, image, settings }, [image.data.buffer]); } catch (error) { this.jobs.delete(id); this.worker?.terminate?.(); this.worker = null; this.onStatus?.({ state: "fallback", detail: error.message || "Trace worker unavailable" }); resolve(composeTrace(fallback, settings)); } }); }
   resolveWorker(message) { const job = this.jobs.get(message.id); if (!job) return; this.jobs.delete(message.id); if (message.error) job.reject(new Error(message.error)); else job.resolve(message.result); }
+  /** Invalidate pending work and notify the UI; cached completed results remain valid. */
   cancel() { this.lastRequest += 1; this.cancelledJobs += this.jobs.size; [...this.jobs.values()].forEach(job => job.cancel?.()); this.jobs.clear(); this.onStatus?.({ state: "cancelled" }); }
   clearLayerCache(source) { const prefix = fingerprint(source); [...this.sourceCache.entries.keys()].filter(key => key.startsWith(prefix)).forEach(key => this.sourceCache.delete(key)); }
   clearSources() { this.sourceCache.clear(); }
   diagnostics() { return { worker: Boolean(this.worker), analysisResolution: this.resolution, cacheEntries: this.cache.size, cacheBytes: this.cache.bytes, sourceCacheEntries: this.sourceCache.size, sourceCacheBytes: this.sourceCache.bytes, cacheHits: this.cache.hits, cacheMisses: this.cache.misses, cancelledJobs: this.cancelledJobs, staleJobs: this.staleJobs, lastDuration: this.lastDuration, lastPreviewDuration: this.lastPreviewDuration }; }
+  /** Release worker and cache resources when the owning workspace is destroyed. */
   dispose() { this.cancel(); this.worker?.terminate(); this.worker = null; this.sourceCache.clear(); this.cache.clear(); }
 }
 
+/** Convert processed RGBA data into a browser-displayable PNG data URL. */
 export async function resultToDataUrl(result, background = "transparent", mode = "Original") { const canvas = document.createElement("canvas"); canvas.width = result.width; canvas.height = result.height; const context = canvas.getContext("2d"); const image = new ImageData(new Uint8ClampedArray(result.data), result.width, result.height); const tonalMode = ["Shadow Blocks", "Posterize", "Grayscale"].includes(mode); const lineMode = ["Clean Lines", "Detailed Lines", "Silhouette", "High Contrast", "Inverted Lines", "Structure", "Clean Contour", "Technical Outline", "High-Contrast Stencil", "Architecture", "Pencil Sketch", "Comic Ink", "Simplified Portrait"].includes(mode); if (lineMode && !tonalMode && (background === "white" || background === "black")) for (let i = 0; i < image.data.length; i += 4) { const edge = image.data[i] > 200 && image.data[i + 3] > 0; const foreground = background === "white" ? 0 : 255; const base = background === "white" ? 255 : 0; const value = edge ? foreground : base; image.data[i] = image.data[i + 1] = image.data[i + 2] = value; image.data[i + 3] = 255; } else if (background === "transparent" && lineMode && !tonalMode) for (let i = 0; i < image.data.length; i += 4) { const edge = image.data[i] > 200 && image.data[i + 3] > 0; image.data[i] = image.data[i + 1] = image.data[i + 2] = 255; image.data[i + 3] = edge ? 255 : 0; } context.putImageData(image, 0, 0); return canvas.toDataURL("image/png"); }

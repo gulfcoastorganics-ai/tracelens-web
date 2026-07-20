@@ -1,3 +1,10 @@
+/**
+ * Browser runtime composition root. This module binds DOM events, owns the
+ * active workspace/session model, coordinates feature services, and renders
+ * small UI updates. Geometry, processing, storage, and state rules stay in
+ * dedicated modules. Optional camera/vision/worker failures must not erase
+ * the current alignment.
+ */
 import { VisionUtils } from "./vision-utils.js";
 import { PerspectiveSolver, OverlaySnapController } from "./perspective.js";
 import { AdaptiveOpacityController } from "./adaptive-opacity.js";
@@ -25,6 +32,7 @@ import { workspaceFingerprint } from "./workspace-history.js";
 import { createTraceQueue } from "./trace-queue.js";
 import { TRACE_MODES, normalizeTraceSettings } from "./trace-presets.js";
 import { normalizeTraceMask } from "./trace-masks.js";
+import { summarizeTrace } from "./trace-analysis.js";
 import { HandTracker } from "./hand-tracker.js";
 import { TraceGuideRenderer } from "./trace-guide-renderer.js";
 import { TraceGuideController } from "./trace-guide.js";
@@ -35,6 +43,12 @@ import { createGuidedState, completeStep, setStep } from "./guided-tracing.js";
 import { compareImageData, comparisonSummary } from "./comparison.js";
 import { addRegion, activeRegion, completeRegion, createRegionState, removeRegion, setActiveRegion } from "./regions.js";
 import { createSessionState, pauseSession, recordSessionEvent, resumeSession, sessionDuration, startSession, stopSession, milestones, replayAt } from "./session-replay.js";
+import { ghostOverlayCssTransform, normalizeGhostOverlay } from "./ghost-overlay.js";
+import { DEFAULT_GHOST_COMPARE, ghostCompareChanged, ghostCompareRenderInstructions, normalizeGhostCompare } from "./ghost-compare.js";
+import { DEFAULT_GHOST_BRUSH, appendGhostBrushTrail, ghostBrushChanged, ghostBrushRenderInstructions, ghostBrushStageToOverlayPoint, normalizeGhostBrush, normalizeGhostBrushPoint, resolveGhostBrushPosition } from "./ghost-brush.js";
+import { BetaDiagnostics, downloadDiagnosticReport, normalizeDiagnosticViewport } from "./beta-diagnostics.js";
+import { waitForVideoMetadata } from "./camera-lifecycle.js";
+import { createViewportCoordinator } from "./viewport-coordinator.js";
 
 const camera = document.querySelector("#camera");
 const overlay = document.querySelector("#overlay");
@@ -53,7 +67,36 @@ const freezeCameraButton = document.querySelector("#freezeCameraButton");
 const captureDrawingButton = document.querySelector("#captureDrawingButton");
 const compareDrawingButton = document.querySelector("#compareDrawingButton");
 const comparisonOverlay = document.querySelector("#comparisonOverlay");
+const compareTraceOverlay = document.querySelector("#compareTraceOverlay");
 const comparisonStatus = document.querySelector("#comparisonStatus");
+const ghostComparePanel = document.querySelector("#ghostComparePanel");
+const ghostCompareStatus = document.querySelector("#ghostCompareStatus");
+const ghostCompareSummary = document.querySelector("#ghostCompareSummary");
+const ghostCompareBlendInput = document.querySelector("#ghostCompareBlendInput");
+const ghostCompareBlendOutput = document.querySelector("#ghostCompareBlendOutput");
+const ghostCompareSplitInput = document.querySelector("#ghostCompareSplitInput");
+const ghostCompareSplitOutput = document.querySelector("#ghostCompareSplitOutput");
+const ghostCompareResetButton = document.querySelector("#ghostCompareResetButton");
+const ghostCompareExitButton = document.querySelector("#ghostCompareExitButton");
+const ghostCompareDivider = document.querySelector("#ghostCompareDivider");
+const ghostBrushPanel = document.querySelector("#ghostBrushPanel");
+const ghostBrushStatus = document.querySelector("#ghostBrushStatus");
+const ghostBrushSummary = document.querySelector("#ghostBrushSummary");
+const ghostBrushToggleButton = document.querySelector("#ghostBrushToggleButton");
+const ghostBrushResetButton = document.querySelector("#ghostBrushResetButton");
+const ghostBrushModeInput = document.querySelector("#ghostBrushModeInput");
+const ghostBrushRadiusInput = document.querySelector("#ghostBrushRadiusInput");
+const ghostBrushRadiusOutput = document.querySelector("#ghostBrushRadiusOutput");
+const ghostBrushFeatherInput = document.querySelector("#ghostBrushFeatherInput");
+const ghostBrushFeatherOutput = document.querySelector("#ghostBrushFeatherOutput");
+const ghostBrushOutsideInput = document.querySelector("#ghostBrushOutsideInput");
+const ghostBrushOutsideOutput = document.querySelector("#ghostBrushOutsideOutput");
+const ghostBrushEdgeInput = document.querySelector("#ghostBrushEdgeInput");
+const ghostBrushEdgeOutput = document.querySelector("#ghostBrushEdgeOutput");
+const ghostBrushTrailInput = document.querySelector("#ghostBrushTrailInput");
+const ghostBrushEndpointInput = document.querySelector("#ghostBrushEndpointInput");
+const ghostBrushTrailInputRange = document.querySelector("#ghostBrushTrailInputRange");
+const ghostBrushTrailOutput = document.querySelector("#ghostBrushTrailOutput");
 const regionOverlay = document.querySelector("#regionOverlay");
 const cameraState = document.querySelector("#cameraState");
 const gridButton = document.querySelector("#gridButton");
@@ -77,6 +120,13 @@ const undoButton = document.querySelector("#undoButton");
 const redoButton = document.querySelector("#redoButton");
 const diagnosticsInput = document.querySelector("#diagnosticsInput");
 const diagnosticsOutput = document.querySelector("#diagnosticsOutput");
+const betaDiagnosticsPanel = document.querySelector("#betaDiagnosticsPanel");
+const betaDiagnosticsSummary = document.querySelector("#betaDiagnosticsSummary");
+const betaDiagnosticsEvents = document.querySelector("#betaDiagnosticsEvents");
+const betaDiagnosticsStatus = document.querySelector("#betaDiagnosticsStatus");
+const betaDiagnosticsCopy = document.querySelector("#betaDiagnosticsCopy");
+const betaDiagnosticsDownload = document.querySelector("#betaDiagnosticsDownload");
+const betaDiagnosticsClear = document.querySelector("#betaDiagnosticsClear");
 const presetInput = document.querySelector("#presetInput");
 const projectList = document.querySelector("#projectList");
 const projectSearchInput = document.querySelector("#projectSearchInput");
@@ -171,21 +221,39 @@ const updateAction = document.querySelector("#updateAction");
 let pendingPWAUpdate = null;
 const featureFlags = normalizeFeatureFlags();
 const appStateMachine = new AppStateMachine({ onInvalid: event => console.warn("[TraceLens state] invalid transition", event.from, event.to) });
+/** Apply a user-visible transition without throwing on stale UI input. */
 function transitionAppState(next, reason = "") { return appStateMachine.tryTransition(next, { reason }); }
 
 let x = 0, y = 0, scale = 1, rotation = 0, opacity = 0.55, flipped = false, stream = null;
+let cameraRequestToken = 0;
+let cameraRequestPending = false;
+let projectOperationToken = 0;
+let imageImportToken = 0;
+let pendingImageReader = null;
 let freezeCamera = false;
 let finishedDrawingImage = null;
-let comparisonActive = false;
 let sessionReplay = createSessionState();
 let replayCursorMs = 0;
-let pointers = new Map(), gestureStart = null, dragging = false, pointerStartX = 0, pointerStartY = 0, originX = 0, originY = 0;
+let pointers = new Map(), gestureStart = null, dragging = false, pointerStartX = 0, pointerStartY = 0, originX = 0, originY = 0, ghostGestureStart = null;
 const overlayTools = document.querySelectorAll(".overlay-tool");
 const WORKSPACE_KEY = "tracelens-workspace-v1";
 let workspaceImage = null;
 let layers = [];
 let activeLayerId = null;
-let comparing = false;
+let compareState = normalizeGhostCompare(DEFAULT_GHOST_COMPARE);
+let compareDifferenceResult = null;
+let compareDifferenceToken = 0;
+let compareSplitPointerId = null;
+let compareSplitBefore = null;
+let compareSplitRect = null;
+let compareRenderSnapshot = null;
+let ghostBrushState = normalizeGhostBrush(DEFAULT_GHOST_BRUSH);
+let ghostBrushPointer = null;
+let ghostBrushPointerActive = false;
+let ghostBrushPointerId = null;
+let ghostBrushPointerRect = null;
+let ghostBrushTrail = [];
+let ghostBrushEdgeToken = 0;
 let perspectiveActive = false;
 let activePerspectiveQuad = null;
 let perspectiveDragIndex = null;
@@ -216,6 +284,11 @@ let overlayReadabilityButtons = null;
 let guidedPanel = null;
 let historyRestoring = false;
 let traceQueue = null;
+let lastPersistenceResult = "unknown";
+let lastDiagnosticViewportKey = "";
+let pendingDifferenceCount = 0;
+let pendingSaveCount = 0;
+let pendingProjectLoadCount = 0;
 const vision = new VisionUtils();
 const perspectiveSolver = new PerspectiveSolver();
 const snapController = new OverlaySnapController(perspectiveOverlay);
@@ -226,6 +299,7 @@ const historySourceIds = new Map();
 const locks = new TransformLocks();
 const guides = new MeasurementGuides(measurementGuides);
 const diagnostics = new Diagnostics(diagnosticsOutput);
+const betaDiagnostics = new BetaDiagnostics({ build: "web-rc1-beta" });
 const calibrationProfiles = new CalibrationProfiles();
 const timeline = new SessionTimeline();
 const gestureCoach = new GestureCoach(gestureCoachElement, { reducedMotion: typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches });
@@ -283,6 +357,8 @@ function updateRegionUI(layer = activeLayer()) {
   const state = createRegionState(layer?.regions); const select = panel.querySelector("[data-region-select]"); const statusOutput = panel.querySelector("[data-region-status]"); const complete = panel.querySelector("[data-region-complete]"); const deleteButton = panel.querySelector("[data-region-delete]");
   if (select) { select.replaceChildren(new Option(state.regions.length ? "Select region" : "No regions yet", ""), ...state.regions.map(region => new Option(`${region.completed ? "✓ " : ""}${region.name}`, region.id))); select.value = state.activeRegionId || ""; }
   const current = activeRegion(state); if (statusOutput) statusOutput.textContent = current ? `${current.shape} · ${Math.round(current.progress * 100)}%${current.notes ? ` · ${current.notes}` : ""}` : "Add a region to focus tracing.";
+  let progress = panel.querySelector("[data-region-progress]"); if (!progress) { progress = document.createElement("progress"); progress.dataset.regionProgress = "true"; progress.max = 1; progress.className = "region-progress"; panel.querySelector("[data-region-status]")?.after(progress); }
+  if (progress) { progress.value = current?.progress || 0; progress.setAttribute("aria-label", current ? `${current.name} progress` : "Trace region progress"); }
   if (complete) complete.textContent = current?.completed ? "Restore region" : "Complete region";
   if (deleteButton) deleteButton.disabled = !current;
   renderRegionOverlay();
@@ -301,13 +377,62 @@ function updateSessionUI() {
 
 function recordSession(type, detail = {}) { sessionReplay = recordSessionEvent(sessionReplay, type, { ...detail, appState: appStateMachine.state }); updateSessionUI(); }
 
+function recordBetaEvent(type, metadata = {}) {
+  betaDiagnostics.record(type, metadata);
+  if (betaDiagnosticsPanel && !betaDiagnosticsPanel.hidden) updateBetaDiagnosticsUI();
+}
+
+function diagnosticReport() {
+  const visual = globalThis.visualViewport;
+  const orientation = globalThis.screen?.orientation;
+  const reducedMotion = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  return betaDiagnostics.report({
+    environment: { userAgent: navigator.userAgent, platform: navigator.platform, language: navigator.language },
+    viewport: normalizeDiagnosticViewport({ width: window.innerWidth, height: window.innerHeight, visualWidth: visual?.width, visualHeight: visual?.height, dpr: window.devicePixelRatio, orientation: orientation?.type, angle: orientation?.angle }),
+    capabilities: { mediaDevices: Boolean(navigator.mediaDevices?.getUserMedia), indexedDB: Boolean(globalThis.indexedDB), serviceWorker: Boolean(navigator.serviceWorker), pointerEvents: Boolean(globalThis.PointerEvent), maxTouchPoints: Number(navigator.maxTouchPoints) || 0, stylusObserved: Boolean(window.__traceLensStylusObserved), reducedMotion, offscreenCanvas: Boolean(globalThis.OffscreenCanvas) },
+    camera: { state: cameraState?.textContent, facingMode: cameraFacing, videoWidth: Number(camera?.videoWidth) || 0, videoHeight: Number(camera?.videoHeight) || 0, mirrored: Boolean(camera?.classList.contains("selfie-camera") || flipped), requestGeneration: cameraRequestToken, streamActive: Boolean(stream) },
+    application: { state: appStateMachine.state, visibility: document.visibilityState, activeProject: Boolean(currentProjectId || workspaceImage), activeLayerValid: Boolean(activeLayer()), activeRegionValid: Boolean(activeRegion(activeLayer()?.regions)), pendingAsyncOperations: { camera: Number(cameraRequestPending), imageImport: Number(Boolean(pendingImageReader)), save: pendingSaveCount, projectLoad: pendingProjectLoadCount, difference: pendingDifferenceCount, trace: Number(Boolean(traceDebounceTimer)) + Number(Boolean(tracePreviewTimer)) }, animationFrameOwners: { visionLoop: visionLoopStarted, compare: compareSplitPointerId !== null, brush: ghostBrushPointerActive } },
+    storage: { indexedDB: Boolean(globalThis.indexedDB), lastPersistenceResult },
+    serviceWorker: { supported: Boolean(navigator.serviceWorker), controller: Boolean(navigator.serviceWorker?.controller), state: navigator.serviceWorker?.controller?.state || "unknown" },
+    features: { diagnostics: featureFlags.diagnostics, ghostOverlay: Boolean(workspaceImage), ghostCompare: Boolean(compareState.enabled), ghostCompareMode: compareState.mode, ghostBrush: Boolean(ghostBrushState.enabled), ghostBrushMode: ghostBrushState.mode, sessionReplay: featureFlags.sessionReplay }
+  });
+}
+
+function updateBetaDiagnosticsUI() {
+  if (!betaDiagnosticsPanel || betaDiagnosticsPanel.hidden) return;
+  const report = diagnosticReport();
+  if (betaDiagnosticsSummary) betaDiagnosticsSummary.textContent = `State: ${report.application.state} · Camera: ${report.camera.state || "unknown"} · Viewport: ${report.viewport.width || 0}×${report.viewport.height || 0}`;
+  if (betaDiagnosticsEvents) {
+    betaDiagnosticsEvents.replaceChildren(...report.recentEvents.slice(-8).reverse().map(event => { const item = document.createElement("li"); item.textContent = `${event.type} · ${new Date(event.timestamp).toLocaleTimeString()}`; return item; }));
+  }
+}
+
+async function copyDiagnosticReport() {
+  const text = JSON.stringify(diagnosticReport(), null, 2);
+  try { await navigator.clipboard.writeText(text); if (betaDiagnosticsStatus) betaDiagnosticsStatus.textContent = "Diagnostic report copied."; }
+  catch { if (betaDiagnosticsStatus) betaDiagnosticsStatus.textContent = "Copy is unavailable; use Download report."; }
+}
+
+function bindBetaDiagnostics() {
+  if (!betaDiagnosticsPanel) return;
+  betaDiagnosticsCopy?.addEventListener("click", copyDiagnosticReport);
+  betaDiagnosticsDownload?.addEventListener("click", () => { const filename = downloadDiagnosticReport(diagnosticReport()); if (betaDiagnosticsStatus) betaDiagnosticsStatus.textContent = filename ? `Downloaded ${filename}` : "Download is unavailable."; });
+  betaDiagnosticsClear?.addEventListener("click", () => { betaDiagnostics.clear(); updateBetaDiagnosticsUI(); if (betaDiagnosticsStatus) betaDiagnosticsStatus.textContent = "Diagnostic event log cleared."; });
+}
+
+window.addEventListener("error", event => { const message = event.error?.message || event.message || "Unhandled application error"; betaDiagnostics.error(message, { source: "window" }); recordBetaEvent("unhandled-application-error", { message }); });
+window.addEventListener("unhandledrejection", event => { const reason = event.reason; const message = reason instanceof Error ? reason.message : String(reason || "Unhandled promise rejection"); betaDiagnostics.error(message, { source: "promise" }); recordBetaEvent("unhandled-promise-rejection", { message }); });
+
 function updateContext() {
   const hasOverlay = Boolean(workspaceImage);
   document.querySelectorAll(".overlay-control").forEach(element => { element.hidden = !hasOverlay; });
   document.querySelectorAll(".perspective-control").forEach(element => { element.hidden = !hasOverlay; });
   document.querySelectorAll(".calibration-control").forEach(element => { element.hidden = !hasOverlay; });
   const diagnosticsEnabled = Boolean(diagnosticsInput?.checked);
+  if (diagnosticsInput) diagnosticsInput.closest(".diagnostics-toggle")?.toggleAttribute("hidden", !featureFlags.diagnostics);
   if (diagnosticsOutput) diagnosticsOutput.hidden = !diagnosticsEnabled;
+  if (betaDiagnosticsPanel) betaDiagnosticsPanel.hidden = !diagnosticsEnabled || !featureFlags.diagnostics;
+  updateBetaDiagnosticsUI();
   if (quickTraceBar) quickTraceBar.hidden = !hasOverlay;
   const guideAvailable = featureFlags.guidedTracing && Boolean(traceHandTracker?.detector);
   if (traceGuideEnabledInput) traceGuideEnabledInput.disabled = !hasOverlay || !guideAvailable;
@@ -317,8 +442,68 @@ function updateContext() {
   if (traceGuideStatus && !guideAvailable) traceGuideStatus.textContent = "Requires local hand-landmark model.";
   const traceGuidePanel = document.querySelector("#traceGuidePanel"); if (traceGuidePanel) traceGuidePanel.dataset.unavailable = String(!guideAvailable);
   updatePresetChips();
+  updateGhostCompareControls();
+  updateGhostBrushControls();
   updateRegionUI(); updateSessionUI();
 }
+
+function ghostBrushEndpoint() {
+  const result = traceResults.get(activeLayerId); const width = Number(result?.analysisWidth); const height = Number(result?.analysisHeight);
+  const lines = Array.isArray(result?.lines) ? result.lines : [];
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const points = Array.isArray(lines[index]?.points) ? lines[index].points : [];
+    for (let pointIndex = points.length - 1; pointIndex >= 0; pointIndex -= 1) {
+      const point = points[pointIndex]; if (Number.isFinite(point?.x) && Number.isFinite(point?.y) && width > 0 && height > 0) return { x: point.x / width * (stage?.clientWidth || 0), y: point.y / height * (stage?.clientHeight || 0) };
+    }
+  }
+  return null;
+}
+
+function updateGhostBrushControls() {
+  const available = Boolean(workspaceImage && activeLayer()?.image); const suspended = compareState.enabled;
+  if (ghostBrushPanel) { ghostBrushPanel.hidden = !available; ghostBrushPanel.dataset.suspended = String(suspended); }
+  if (ghostBrushToggleButton) { ghostBrushToggleButton.disabled = !available || suspended; ghostBrushToggleButton.textContent = ghostBrushState.enabled ? "Disable guidance" : "Enable guidance"; ghostBrushToggleButton.setAttribute("aria-pressed", String(ghostBrushState.enabled)); }
+  [ghostBrushModeInput, ghostBrushRadiusInput, ghostBrushFeatherInput, ghostBrushOutsideInput, ghostBrushEdgeInput, ghostBrushTrailInput, ghostBrushEndpointInput, ghostBrushTrailInputRange].forEach(input => { if (input) input.disabled = !available || suspended; });
+  if (ghostBrushModeInput) ghostBrushModeInput.value = ghostBrushState.mode;
+  if (ghostBrushRadiusInput) ghostBrushRadiusInput.value = String(ghostBrushState.radius);
+  if (ghostBrushRadiusOutput) ghostBrushRadiusOutput.textContent = `${ghostBrushState.radius}px`;
+  if (ghostBrushFeatherInput) ghostBrushFeatherInput.value = String(ghostBrushState.feather);
+  if (ghostBrushFeatherOutput) ghostBrushFeatherOutput.textContent = `${Math.round(ghostBrushState.feather * 100)}%`;
+  if (ghostBrushOutsideInput) ghostBrushOutsideInput.value = String(ghostBrushState.outsideOpacity);
+  if (ghostBrushOutsideOutput) ghostBrushOutsideOutput.textContent = `${Math.round(ghostBrushState.outsideOpacity * 100)}%`;
+  if (ghostBrushEdgeInput) ghostBrushEdgeInput.value = String(ghostBrushState.edgeStrength);
+  if (ghostBrushEdgeOutput) ghostBrushEdgeOutput.textContent = `${Math.round(ghostBrushState.edgeStrength * 100)}%`;
+  if (ghostBrushTrailInput) ghostBrushTrailInput.checked = ghostBrushState.trailEnabled;
+  if (ghostBrushEndpointInput) ghostBrushEndpointInput.checked = ghostBrushState.followEndpoint;
+  if (ghostBrushTrailInputRange) ghostBrushTrailInputRange.value = String(ghostBrushState.trailLength);
+  if (ghostBrushTrailOutput) ghostBrushTrailOutput.textContent = `${ghostBrushState.trailLength} points`;
+  if (ghostBrushStatus) ghostBrushStatus.textContent = suspended ? "Suspended during Compare" : !available ? "Add a reference image." : !ghostBrushState.enabled ? "Guidance off" : (!ghostBrushPointerActive && ghostBrushState.followEndpoint && !ghostBrushEndpoint() ? "No trace endpoint yet" : "Guidance active");
+  if (ghostBrushSummary) ghostBrushSummary.textContent = ghostBrushState.mode === "edge-focus" ? "Local contrast emphasis · not analytical edge detection." : "Guidance follows your tracing location and never alters the trace.";
+}
+
+function clearGhostBrushRender() { overlay.style.maskImage = "none"; overlay.style.webkitMaskImage = "none"; overlay.style.filter = "none"; perspectiveOverlay.style.maskImage = "none"; perspectiveOverlay.style.webkitMaskImage = "none"; perspectiveOverlay.style.filter = "none"; }
+function renderGhostBrush({ updateControls = false } = {}) {
+  clearGhostBrushRender();
+  const target = perspectiveActive && !perspectiveOverlay.hidden ? perspectiveOverlay : overlay;
+  if (!ghostBrushState.enabled || compareState.enabled || !workspaceImage || !stage?.clientWidth || !stage?.clientHeight || target.hidden) { if (updateControls) updateGhostBrushControls(); return; }
+  const width = stage.clientWidth; const height = stage.clientHeight; const endpoint = ghostBrushEndpoint(); const position = resolveGhostBrushPosition({ pointer: ghostBrushPointerActive ? ghostBrushPointer : null, endpoint, followEndpoint: ghostBrushState.followEndpoint }, { width, height });
+  const instructions = ghostBrushState.mode === "endpoint" && !position ? { visible: false } : ghostBrushRenderInstructions(ghostBrushState, position, { width, height, trail: ghostBrushTrail });
+  if (!instructions.visible) { updateGhostBrushControls(); return; }
+  let renderInstructions = instructions;
+  if (target === overlay) {
+    const localPosition = ghostBrushStageToOverlayPoint(instructions.position, { x, y, scale, rotation, flipped }, { width, height });
+    const localTrail = instructions.trail.map(point => ghostBrushStageToOverlayPoint(point, { x, y, scale, rotation, flipped }, { width, height })).filter(Boolean);
+    renderInstructions = ghostBrushRenderInstructions({ ...ghostBrushState, radius: ghostBrushState.radius / Math.max(.1, Math.abs(scale)) }, localPosition, { width, height, trail: localTrail });
+  }
+  target.style.maskImage = renderInstructions.mask; target.style.webkitMaskImage = renderInstructions.mask; target.style.maskSize = "100% 100%"; target.style.webkitMaskSize = "100% 100%"; target.style.opacity = String(Math.max(0, Math.min(1, opacity * renderInstructions.opacity))); target.style.filter = renderInstructions.filter;
+  if (ghostBrushStatus && !ghostBrushPointerActive && !endpoint) ghostBrushStatus.textContent = "No trace endpoint yet";
+  if (updateControls) updateGhostBrushControls();
+}
+
+function setGhostBrushState(next, { commit = false } = {}) { const previous = ghostBrushState; ghostBrushState = normalizeGhostBrush(next); renderGhostBrush({ updateControls: true }); if (commit && ghostBrushChanged(previous, ghostBrushState)) pushHistory(); }
+function resetGhostBrush() { const previous = ghostBrushState; ghostBrushState = normalizeGhostBrush(DEFAULT_GHOST_BRUSH); ghostBrushTrail = []; renderGhostBrush({ updateControls: true }); if (ghostBrushChanged(previous, ghostBrushState)) pushHistory(); }
+function updateGhostBrushPointer(event, { active = true } = {}) { if (!stage || !ghostBrushState.enabled || compareState.enabled) return; const rect = ghostBrushPointerRect || stage.getBoundingClientRect(); const point = normalizeGhostBrushPoint({ x: event.clientX - rect.left, y: event.clientY - rect.top }, { width: stage.clientWidth, height: stage.clientHeight }); if (!point) return; ghostBrushPointer = point; ghostBrushPointerActive = active; if (ghostBrushState.trailEnabled && ghostBrushState.mode === "trail") ghostBrushTrail = appendGhostBrushTrail(ghostBrushTrail, point, { maxSamples: ghostBrushState.trailLength, time: performance.now() }); renderGhostBrush(); }
+function releaseGhostBrushInteraction({ clearTrail = false } = {}) { ghostBrushPointerActive = false; ghostBrushPointerId = null; ghostBrushPointerRect = null; if (clearTrail) ghostBrushTrail = []; renderGhostBrush(); }
 
 function organizeTraceControls() {
   const panel = document.querySelector("#traceAssistPanel"); const advanced = document.querySelector("#traceAdvanced"); const modeRow = traceModeInput?.closest(".trace-mode-row"); const traceGuidePanel = document.querySelector("#traceGuidePanel"); if (!panel || !advanced || !modeRow || panel.dataset.organized === "true") return;
@@ -364,7 +549,7 @@ function applyTraceControls(layer) {
 }
 function updateTraceOutputs() { if (traceStrengthOutput && traceStrengthInput) traceStrengthOutput.textContent = `${Math.round(Number(traceStrengthInput.value) * 100)}%`; if (traceDetailOutput && traceDetailInput) traceDetailOutput.textContent = `${Math.round(Number(traceDetailInput.value) * 100)}%`; if (tracePriorityOutput && tracePriorityInput) tracePriorityOutput.textContent = `${Math.round(Number(tracePriorityInput.value) * 100)}%`; if (traceThresholdOutput && traceThresholdInput) traceThresholdOutput.textContent = `${Math.round(Number(traceThresholdInput.value) * 100)}%`; if (traceBlurOutput && traceBlurInput) traceBlurOutput.textContent = traceBlurInput.value; }
 function updateTraceQuickUI(layer = activeLayer()) { const trace = layer ? traceState(layer) : DEFAULT_TRACE; traceModeChips?.querySelectorAll("[data-trace-mode]").forEach(button => button.classList.toggle("active", button.dataset.traceMode === trace.mode)); if (quickTraceModeButton) quickTraceModeButton.textContent = trace.mode === "Original" ? "Original" : trace.mode.replace(" Lines", ""); if (quickOriginalButton) quickOriginalButton.setAttribute("aria-pressed", String(trace.mode === "Original" || traceCompareHold)); if (quickAssistButton) quickAssistButton.setAttribute("aria-pressed", String(trace.enabled && !traceCompareHold)); }
-function setTraceSheet(nextState = "closed", view = "trace") { if (!adjustSheet) return; traceSheetState = nextState; const open = nextState !== "closed"; if (open && layersExpanded) { layersExpanded = false; if (layersList) layersList.hidden = true; layerCard?.classList.remove("layers-expanded"); layersToggle?.setAttribute("aria-expanded", "false"); } adjustSheet.classList.toggle("open", open); adjustSheet.dataset.state = nextState; adjustSheet.dataset.view = view; adjustSheet.setAttribute("aria-hidden", String(!open)); document.body.classList.toggle("sheet-open", open); document.body.classList.toggle("trace-mode", open && view === "trace"); stage?.classList.toggle("adjust-open", open); if (adjustTitle) adjustTitle.textContent = view === "trace" ? "Trace Assist" : "Adjust overlay"; if (quickTraceExpandButton) quickTraceExpandButton.textContent = nextState === "expanded" ? "⌄" : "⌃"; if (open) window.setTimeout(() => closeAdjust?.focus(), 0); }
+function setTraceSheet(nextState = "closed", view = "trace") { if (!adjustSheet) return; const open = nextState !== "closed"; if (open) { releaseGhostInteraction(); releaseCompareInteraction({ restore: true }); releaseGhostBrushInteraction({ clearTrail: true }); } traceSheetState = nextState; if (open && layersExpanded) { layersExpanded = false; if (layersList) layersList.hidden = true; layerCard?.classList.remove("layers-expanded"); layersToggle?.setAttribute("aria-expanded", "false"); } adjustSheet.classList.toggle("open", open); adjustSheet.dataset.state = nextState; adjustSheet.dataset.view = view; adjustSheet.setAttribute("aria-hidden", String(!open)); document.body.classList.toggle("sheet-open", open); document.body.classList.toggle("trace-mode", open && view === "trace"); stage?.classList.toggle("adjust-open", open); if (adjustTitle) adjustTitle.textContent = view === "trace" ? "Trace Assist" : "Adjust overlay"; if (quickTraceExpandButton) quickTraceExpandButton.textContent = nextState === "expanded" ? "⌄" : "⌃"; if (open) window.setTimeout(() => closeAdjust?.focus(), 0); }
 function bindSheetDrag() { if (!sheetHandle || !adjustSheet) return; let draggingSheet = false; sheetHandle.addEventListener("pointerdown", event => { if (!adjustSheet.classList.contains("open")) return; draggingSheet = true; sheetHandle.setPointerCapture?.(event.pointerId); event.preventDefault(); }); sheetHandle.addEventListener("pointerup", event => { if (!draggingSheet) return; draggingSheet = false; sheetHandle.releasePointerCapture?.(event.pointerId); const viewport = globalThis.visualViewport?.height || window.innerHeight; const ratio = Math.max(0, Math.min(1, (viewport - event.clientY) / viewport)); const next = ratio < .35 ? "peek" : ratio < .72 ? "half" : "expanded"; setTraceSheet(next, adjustSheet.dataset.view || "trace"); }); sheetHandle.addEventListener("pointercancel", () => { draggingSheet = false; }); }
 function setTraceMode(mode) { const layer = activeLayer(); if (!layer || !TRACE_MODES.includes(mode)) return; if (mode !== "Original") lastAssistMode = mode; traceState(layer).mode = mode; traceState(layer).enabled = mode !== "Original"; if (traceModeInput) traceModeInput.value = mode; applyTraceControls(layer); updateTraceQuickUI(layer); if (mode !== "Original") transitionAppState("Tracing", `trace mode: ${mode}`); queueTraceRefresh(); }
 function captureTraceControls(layer) { const trace = traceState(layer); trace.mode = TRACE_MODES.includes(traceModeInput?.value) ? traceModeInput.value : trace.mode; trace.enabled = trace.mode !== "Original"; trace.stage = Number(traceStageInput?.value) || 0; trace.settings = { ...trace.settings, strength: Number(traceStrengthInput?.value ?? trace.settings.strength), detail: Number(traceDetailInput?.value ?? trace.settings.detail), priority: Number(tracePriorityInput?.value ?? trace.settings.priority), lineWeight: traceLineWeightInput?.value || trace.settings.lineWeight, levels: Number(traceLevelsInput?.value ?? trace.settings.levels) || 0, isolation: Boolean(traceIsolationInput?.checked), threshold: Number(traceThresholdInput?.value ?? trace.settings.threshold), blur: Number(traceBlurInput?.value ?? trace.settings.blur), background: traceBackgroundInput?.value || trace.settings.background, focusShape: traceFocusShapeInput?.value || trace.settings.focusShape, outsideOpacity: Number(traceOutsideOpacityInput?.value ?? trace.settings.outsideOpacity) || 0, assistOpacity: Number(quickTraceOpacityInput?.value ?? trace.settings.assistOpacity) || 1, overlayEmphasis: Number(overlayEmphasisInput?.value ?? trace.settings.overlayEmphasis ?? .5), readabilityMode: trace.settings.readabilityMode || "blend", mask: normalizeTraceMask(trace.settings.mask) }; return trace; }
@@ -373,7 +558,7 @@ function traceSettings(layer, preview = false) { const trace = traceState(layer)
 async function refreshTraceView(layer) {
   if (!layer || layer.id !== activeLayerId || document.hidden) return;
   const trace = traceState(layer); traceRequestToken += 1; const token = traceRequestToken; applyTraceControls(layer); if (!trace.enabled || trace.mode === "Original") { traceResults.delete(layer.id); overlay.src = layer.image; renderOverlay(); return; }
-  try { const result = await traceEngine.process(layer.image, traceSettings(layer)); if (token !== traceRequestToken || layer.id !== activeLayerId || result.cancelled) return; const dataUrl = await resultToDataUrl(result, trace.settings.background, trace.mode); traceResults.set(layer.id, { dataUrl, key: result.key, quality: result.quality, lines: result.lines, analysisWidth: result.width, analysisHeight: result.height }); trace.cacheKey = result.key; updateTraceGuideTarget(); if (traceQuality) { traceQuality.textContent = result.quality?.warnings?.[0] ? `Quality ${result.quality.score}% · ${result.quality.warnings[0]}` : `Quality ${result.quality?.score ?? 0}% · ${result.quality?.status || "Complete"}`; traceQuality.dataset.state = result.quality?.score >= 60 ? "good" : "warning"; } overlay.src = dataUrl; renderOverlay(); if (traceRetryButton) traceRetryButton.hidden = true; if (perspectiveActive && activePerspectiveQuad) snapController.snap(activeRenderSource(), perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); } catch (error) { trace.enabled = false; trace.mode = "Original"; overlay.src = layer.image; if (traceRetryButton) traceRetryButton.hidden = false; if (traceProcessing) { traceProcessing.hidden = false; traceProcessing.textContent = "Failed · retry available"; } if (traceQuality) traceQuality.textContent = "Trace failed · Original restored · Retry available"; status.textContent = "Trace Assist could not process this image. Original restored. Retry is available."; console.error("[TraceLens trace] processing failed", error); }
+  try { const result = await traceEngine.process(layer.image, traceSettings(layer)); if (token !== traceRequestToken || layer.id !== activeLayerId || result.cancelled) return; const dataUrl = await resultToDataUrl(result, trace.settings.background, trace.mode); const summary = summarizeTrace(result); traceResults.set(layer.id, { dataUrl, key: result.key, quality: result.quality, summary, lines: result.lines, analysisWidth: result.width, analysisHeight: result.height }); trace.cacheKey = result.key; updateTraceGuideTarget(); if (traceQuality) { const warning = result.quality?.warnings?.[0]; traceQuality.textContent = warning ? `Quality ${summary.quality}% · ${warning}` : `Quality ${summary.quality}% · ${summary.lineCount} lines · ${Math.round(summary.coverage * 100)}% coverage`; traceQuality.dataset.state = summary.quality >= 60 ? "good" : "warning"; traceQuality.title = `${summary.contourCount} contours · ${summary.totalLength}px traced`; } overlay.src = dataUrl; renderOverlay(); if (traceRetryButton) traceRetryButton.hidden = true; if (perspectiveActive && activePerspectiveQuad) snapController.snap(activeRenderSource(), perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); } catch (error) { trace.enabled = false; trace.mode = "Original"; overlay.src = layer.image; if (traceRetryButton) traceRetryButton.hidden = false; if (traceProcessing) { traceProcessing.hidden = false; traceProcessing.textContent = "Failed · retry available"; } if (traceQuality) traceQuality.textContent = "Trace failed · Original restored · Retry available"; status.textContent = "Trace Assist could not process this image. Original restored. Retry is available."; console.error("[TraceLens trace] processing failed", error); }
 }
 async function previewTraceView(layer) {
   if (!layer || layer.id !== activeLayerId || document.hidden || !traceState(layer).enabled) return;
@@ -395,23 +580,27 @@ let traceGuideContourIndex = 0;
 function updateTraceGuideTarget() { const result = traceResults.get(activeLayerId); const line = result?.lines?.[traceGuideContourIndex] || result?.lines?.[0]; if (!line || !stage) { traceGuide.setContour([]); return; } const width = result.analysisWidth || stage.clientWidth; const height = result.analysisHeight || stage.clientHeight; const target = line.points.map(point => ({ x: point.x / width * stage.clientWidth, y: point.y / height * stage.clientHeight })); traceGuide.setContour(target, { id: `${activeLayerId}:${traceGuideContourIndex}`, closed: false, spacing: 5 }); }
 function nextTraceGuideContour() { const count = traceResults.get(activeLayerId)?.lines?.length || 0; if (!count) { status.textContent = "Process a Trace Assist contour first."; return; } traceGuideContourIndex = (traceGuideContourIndex + 1) % count; updateTraceGuideTarget(); status.textContent = `Suggested contour ${traceGuideContourIndex + 1} of ${count}.`; }
 function legacyLayer(project, name) { return createLayer({ image: project.image, name, x: project.x, y: project.y, scale: project.scale, rotation: project.rotation, opacity: project.opacity, flipped: project.flipped, blendMode: project.blendMode, guide: project.guide, physicalCalibration: project.physicalCalibration, perspective: project.perspective ? { enabled: true, locked: Boolean(project.perspectiveLocked), quad: project.perspective } : null, locked: project.locks?.position }); }
+function validImageSource(source) { return typeof source === "string" && source.length > 0 && source.length <= 50 * 1024 * 1024 && /^(data:image\/[a-z0-9.+-]+;base64,|blob:|https?:\/\/)/i.test(source); }
 
 function syncActiveLayer() {
   const layer = activeLayer();
   if (!layer) return;
-  Object.assign(layer, { x, y, scale, rotation, opacity, flipped, blendMode: blendModeInput?.value || layer.blendMode, guide: guideInput?.value || layer.guide, physicalCalibration, trace: traceState(layer), perspective: perspectiveActive && activePerspectiveQuad ? { enabled: true, locked: surfaceTracker.locked, quad: activePerspectiveQuad.map(point => ({ ...point })) } : null, visible: !overlay.hidden, locked: locks.position });
+  const ghost = normalizeGhostOverlay({ ...layer.ghost, enabled: compareState.enabled ? layer.visible !== false : !overlay.hidden, imageRef: layer.id, x, y, scale, rotation, opacity, locked: locks.position }, { viewportWidth: stage?.clientWidth, viewportHeight: stage?.clientHeight });
+  Object.assign(layer, { x: ghost.x, y: ghost.y, scale: ghost.scale, rotation: ghost.rotation, opacity: ghost.opacity, flipped, ghost, blendMode: blendModeInput?.value || layer.blendMode, guide: guideInput?.value || layer.guide, physicalCalibration, trace: traceState(layer), perspective: perspectiveActive && activePerspectiveQuad ? { enabled: true, locked: surfaceTracker.locked, quad: activePerspectiveQuad.map(point => ({ ...point })) } : null, visible: ghost.enabled, locked: ghost.locked });
 }
 
 function loadLayerState(layer) {
   if (!layer) return;
-  activeLayerId = layer.id; workspaceImage = layer.image; x = Number(layer.x) || 0; y = Number(layer.y) || 0; scale = Number(layer.scale) || 1; rotation = Number(layer.rotation) || 0; opacity = Number(layer.opacity) || .55; flipped = Boolean(layer.flipped);
+  const ghost = normalizeGhostOverlay(layer.ghost || { ...layer, enabled: layer.visible !== false, locked: layer.locked }, { viewportWidth: stage?.clientWidth, viewportHeight: stage?.clientHeight });
+  activeLayerId = layer.id; workspaceImage = layer.image; x = ghost.x; y = ghost.y; scale = ghost.scale; rotation = ghost.rotation; opacity = ghost.opacity; flipped = Boolean(layer.flipped); layer.ghost = ghost;
   if (blendModeInput) blendModeInput.value = layer.blendMode || "Normal"; if (guideInput) guideInput.value = layer.guide || "none"; guides.setMode(layer.guide || "none"); physicalCalibration = layer.physicalCalibration || null; if (opacityInput) opacityInput.value = opacity; if (scaleInput) scaleInput.value = scale; if (rotationInput) rotationInput.value = rotation; if (positionXNumber) positionXNumber.value = Math.round(x); if (positionYNumber) positionYNumber.value = Math.round(y); blendSwatches?.querySelectorAll("[data-blend]").forEach(button => button.classList.toggle("active", button.dataset.blend === (layer.blendMode || "Normal")));
-  activePerspectiveQuad = layer.perspective?.quad ? layer.perspective.quad.map(point => ({ ...point })) : null; perspectiveActive = Boolean(activePerspectiveQuad?.length === 4); surfaceTracker.locked = Boolean(layer.perspective?.locked); overlay.src = layer.image; overlay.hidden = layer.visible === false; overlay.style.visibility = "visible"; const display = resolveOverlayDisplay({ visible: layer.visible !== false, perspective: perspectiveActive }); overlay.style.display = display.overlay ? "block" : "none"; if (display.perspective) snapController.snap(activeRenderSource(), perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); else snapController.clear(); if (layerThumb) layerThumb.src = workspaceImage; if (layerName) layerName.textContent = layer.name; traceGuideContourIndex = 0; applyLocks({ position: Boolean(layer.locked) }); applyTraceControls(layer); updateRegionUI(layer); refreshTraceView(layer);
+  activePerspectiveQuad = layer.perspective?.quad ? layer.perspective.quad.map(point => ({ ...point })) : null; perspectiveActive = Boolean(activePerspectiveQuad?.length === 4); surfaceTracker.locked = Boolean(layer.perspective?.locked); overlay.src = layer.image; overlay.hidden = !ghost.enabled; overlay.style.visibility = "visible"; const display = resolveOverlayDisplay({ visible: ghost.enabled, perspective: perspectiveActive }); overlay.style.display = display.overlay ? "block" : "none"; if (display.perspective) snapController.snap(activeRenderSource(), perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); else snapController.clear(); if (layerThumb) layerThumb.src = workspaceImage; if (layerName) layerName.textContent = layer.name; traceGuideContourIndex = 0; applyLocks({ position: ghost.locked }); applyTraceControls(layer); updateRegionUI(layer); refreshTraceView(layer);
 }
 
 function renderLayerElement(element, layer, index) {
   const flip = layer.flipped ? -1 : 1;
-  element.src = traceResults.get(layer.id)?.dataUrl || layer.image; element.hidden = layer.visible === false; element.style.display = layer.visible === false ? "none" : "block"; element.style.opacity = layer.opacity; element.style.transform = `translate(${layer.x}px, ${layer.y}px) scale(${layer.scale * flip}, ${layer.scale}) rotate(${layer.rotation}deg)`; element.style.mixBlendMode = layer.blendMode.toLowerCase(); element.style.zIndex = String(index + 1);
+  const ghost = normalizeGhostOverlay(layer.ghost || layer, { viewportWidth: stage?.clientWidth, viewportHeight: stage?.clientHeight });
+  element.src = traceResults.get(layer.id)?.dataUrl || layer.image; element.hidden = !ghost.enabled; element.style.display = ghost.enabled ? "block" : "none"; element.style.opacity = ghost.opacity; element.style.transform = ghostOverlayCssTransform(ghost, { flip: layer.flipped, viewportWidth: stage?.clientWidth, viewportHeight: stage?.clientHeight }); element.style.mixBlendMode = layer.blendMode.toLowerCase(); element.style.zIndex = String(index + 1);
 }
 
 function renderLayers(refreshList = false) {
@@ -443,7 +632,7 @@ function renderLayerList() {
 }
 
 function setLayers(nextLayers, selectedId = null) {
-  layers = cloneLayers(nextLayers); activeLayerId = selectedId || layers.at(-1)?.id || null; layersExpanded = globalThis.localStorage?.getItem(LAYER_CARD_STATE_KEY) === "true"; layerCard?.classList.toggle("layers-expanded", layersExpanded); if (layersList) layersList.hidden = !layersExpanded; layersToggle?.setAttribute("aria-expanded", String(layersExpanded)); const layer = activeLayer(); if (layer) loadLayerState(layer); renderLayers(true); updateContext();
+  layers = cloneLayers(Array.isArray(nextLayers) ? nextLayers : []); activeLayerId = layers.some(layer => layer.id === selectedId) ? selectedId : (layers.at(-1)?.id || null); layersExpanded = globalThis.localStorage?.getItem(LAYER_CARD_STATE_KEY) === "true"; layerCard?.classList.toggle("layers-expanded", layersExpanded); if (layersList) layersList.hidden = !layersExpanded; layersToggle?.setAttribute("aria-expanded", String(layersExpanded)); const layer = activeLayer(); if (layer) loadLayerState(layer); renderLayers(true); updateContext();
 }
 
 function restoreLayerVisibility(layer = activeLayer()) {
@@ -462,11 +651,160 @@ function confirmPerspectiveLock() {
   snapController.snap(activeRenderSource(), perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); overlay.style.display = "none"; selectionFrame.classList.add("surface-found"); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; syncActiveLayer(); pushHistory(); status.textContent = "Perspective locked."; visionStatus.textContent = "Perspective locked · Tracking"; addTimeline("Perspective Locked"); updateContext(); return true;
 }
 
+function ghostCompareDifferenceAvailable() { return compareDifferenceResult?.status === "complete"; }
+function ghostCompareHasTrace() { return Boolean(finishedDrawingImage); }
+
+function updateGhostCompareControls() {
+  const hasReference = Boolean(workspaceImage && activeLayer()?.image);
+  const hasTrace = ghostCompareHasTrace();
+  const differenceAvailable = ghostCompareDifferenceAvailable();
+  const modeButtons = ghostComparePanel?.querySelectorAll("[data-compare-mode]") || [];
+  modeButtons.forEach(button => {
+    const mode = button.dataset.compareMode;
+    button.disabled = !hasReference || (mode !== "reference" && mode !== "difference" && !hasTrace) || (mode === "difference" && !differenceAvailable);
+    button.classList.toggle("active", mode === compareState.mode);
+    button.setAttribute("aria-pressed", String(mode === compareState.mode));
+  });
+  if (ghostComparePanel) ghostComparePanel.hidden = !compareState.enabled || !hasReference;
+  if (ghostCompareBlendInput) { ghostCompareBlendInput.value = String(compareState.blend); ghostCompareBlendInput.disabled = !hasTrace; }
+  if (ghostCompareBlendOutput) ghostCompareBlendOutput.textContent = `${Math.round(compareState.blend * 100)}%`;
+  if (ghostCompareSplitInput) ghostCompareSplitInput.value = String(compareState.splitPosition);
+  if (ghostCompareSplitOutput) ghostCompareSplitOutput.textContent = `${Math.round(compareState.splitPosition * 100)}%`;
+  if (ghostCompareStatus) ghostCompareStatus.textContent = !hasReference ? "Add a reference to compare." : !hasTrace ? "Capture a finished drawing for Trace, Blend, or Split." : compareState.mode === "difference" && !differenceAvailable ? "Difference is unavailable until a valid raster comparison is ready." : "Inspection mode";
+  if (ghostCompareSummary && differenceAvailable) ghostCompareSummary.textContent = `Raster difference aid · ${comparisonSummary(compareDifferenceResult)} · not a measurement guarantee.`;
+  if (compareButton) { compareButton.classList.toggle("active", compareState.enabled); compareButton.setAttribute("aria-pressed", String(compareState.enabled)); }
+  if (compareDrawingButton) compareDrawingButton.textContent = compareState.enabled ? "Close Compare" : "Compare";
+}
+
+function clearGhostCompareRender() {
+  if (compareRenderSnapshot) { overlay.hidden = compareRenderSnapshot.overlayHidden; perspectiveOverlay.hidden = compareRenderSnapshot.perspectiveHidden; compareRenderSnapshot = null; }
+  overlay.style.clipPath = "none"; perspectiveOverlay.style.clipPath = "none";
+  overlay.classList.remove("comparison-hidden"); perspectiveOverlay.classList.remove("comparison-hidden"); comparisonOverlay.hidden = true; compareTraceOverlay.hidden = true;
+  ghostCompareDivider.hidden = true; ghostCompareDivider.style.display = "none";
+  compareTraceOverlay.style.clipPath = "none"; compareTraceOverlay.style.opacity = "0";
+}
+
+function renderGhostCompare() {
+  const width = stage?.clientWidth || 0; const height = stage?.clientHeight || 0;
+  if (!compareState.enabled || !workspaceImage || !width || !height) { clearGhostCompareRender(); updateGhostCompareControls(); return; }
+  const differenceAvailable = ghostCompareDifferenceAvailable();
+  const instructions = ghostCompareRenderInstructions(compareState, { width, height, differenceAvailable });
+  const reference = perspectiveActive && !perspectiveOverlay.hidden ? perspectiveOverlay : overlay;
+  const otherReference = reference === overlay ? perspectiveOverlay : overlay;
+  const referenceReady = Boolean(reference.src || workspaceImage);
+  const traceReady = ghostCompareHasTrace();
+  reference.style.clipPath = instructions.referenceClipPath;
+  otherReference.style.clipPath = "none";
+  reference.style.opacity = String(instructions.referenceOpacity);
+  reference.style.zIndex = "6";
+  otherReference.classList.add("comparison-hidden");
+  compareTraceOverlay.style.clipPath = instructions.traceClipPath;
+  compareTraceOverlay.style.opacity = String(instructions.traceOpacity);
+  compareTraceOverlay.style.zIndex = "5";
+  if (traceReady && compareTraceOverlay.src !== finishedDrawingImage) compareTraceOverlay.src = finishedDrawingImage;
+  reference.hidden = !instructions.referenceVisible || !referenceReady;
+  otherReference.hidden = true;
+  compareTraceOverlay.hidden = !instructions.traceVisible || !traceReady;
+  if (instructions.differenceVisible && compareDifferenceResult?.diff) {
+    comparisonOverlay.width = compareDifferenceResult.width; comparisonOverlay.height = compareDifferenceResult.height;
+    const context = comparisonOverlay.getContext("2d");
+    if (context) { context.clearRect(0, 0, comparisonOverlay.width, comparisonOverlay.height); context.putImageData(new ImageData(compareDifferenceResult.diff.data, compareDifferenceResult.width, compareDifferenceResult.height), 0, 0); }
+    comparisonOverlay.hidden = false; comparisonOverlay.style.opacity = "1"; comparisonOverlay.style.zIndex = "7";
+    reference.hidden = true; compareTraceOverlay.hidden = true;
+  } else comparisonOverlay.hidden = true;
+  if (instructions.mode === "split" && instructions.visible && traceReady) {
+    ghostCompareDivider.hidden = false; ghostCompareDivider.style.display = instructions.splitOrientation === "horizontal" ? "block" : "block";
+    if (instructions.splitOrientation === "horizontal") { ghostCompareDivider.style.width = "100%"; ghostCompareDivider.style.height = "2px"; ghostCompareDivider.style.left = "0"; ghostCompareDivider.style.top = instructions.dividerPosition; ghostCompareDivider.style.transform = "translateY(-1px)"; ghostCompareDivider.style.cursor = "ns-resize"; } else { ghostCompareDivider.style.width = "2px"; ghostCompareDivider.style.height = "100%"; ghostCompareDivider.style.left = instructions.dividerPosition; ghostCompareDivider.style.top = "0"; ghostCompareDivider.style.transform = "translateX(-1px)"; ghostCompareDivider.style.cursor = "ew-resize"; }
+    ghostCompareDivider.setAttribute("aria-orientation", instructions.splitOrientation);
+    ghostCompareDivider.setAttribute("aria-valuenow", String(Math.round(compareState.splitPosition * 100)));
+  }
+  updateGhostCompareControls();
+}
+
+async function prepareGhostDifference() {
+  pendingDifferenceCount += 1;
+  const token = ++compareDifferenceToken; const reference = activeLayer()?.image; const trace = finishedDrawingImage;
+  compareDifferenceResult = null; compareState = normalizeGhostCompare(compareState, { differenceAvailable: false }); renderGhostCompare();
+  if (!reference || !trace) { updateGhostCompareControls(); pendingDifferenceCount = Math.max(0, pendingDifferenceCount - 1); return null; }
+  try {
+    const result = compareImageData(await loadImageData(reference), await loadImageData(trace));
+    if (token !== compareDifferenceToken || result.status !== "complete") return null;
+    compareDifferenceResult = result; if (comparisonStatus) comparisonStatus.textContent = `Raster difference aid · ${comparisonSummary(result)}.`; renderGhostCompare(); return result;
+  } catch (error) {
+    if (token === compareDifferenceToken) { compareDifferenceResult = null; if (comparisonStatus) comparisonStatus.textContent = "Difference unavailable · the captured images could not be decoded."; updateGhostCompareControls(); }
+    console.warn("[TraceLens comparison] difference preparation failed", error); return null;
+  } finally {
+    pendingDifferenceCount = Math.max(0, pendingDifferenceCount - 1);
+  }
+}
+
+function setGhostCompareMode(mode) {
+  const requested = normalizeGhostCompare({ ...compareState, mode }, { differenceAvailable: ghostCompareDifferenceAvailable() });
+  if (mode === "difference" && !ghostCompareDifferenceAvailable()) { prepareGhostDifference(); if (ghostCompareStatus) ghostCompareStatus.textContent = "Preparing raster Difference…"; return; }
+  const previous = compareState; compareState = { ...requested, enabled: previous.enabled }; renderGhostCompare(); if (ghostCompareChanged(previous, compareState)) pushHistory();
+}
+
+function setGhostCompareEnabled(enabled) {
+  const next = Boolean(enabled) && Boolean(workspaceImage && activeLayer()?.image);
+  if (!next && enabled) { status.textContent = "Add a reference image before comparing."; return; }
+  releaseCompareInteraction({ restore: true });
+  if (!next && compareState.enabled) clearGhostCompareRender();
+  if (next && !compareState.enabled) compareRenderSnapshot = { overlayHidden: overlay.hidden, perspectiveHidden: perspectiveOverlay.hidden };
+  compareState = normalizeGhostCompare({ ...compareState, enabled: next }, { differenceAvailable: ghostCompareDifferenceAvailable() });
+  transitionAppState(next ? "Comparing" : (workspaceImage ? "Reviewing" : "Home"), next ? "Ghost Compare opened" : "Ghost Compare closed");
+  if (next && !ghostCompareHasTrace()) compareState = { ...compareState, mode: "reference" };
+  renderOverlay();
+  updateGhostBrushControls();
+}
+
+function resetGhostCompare() {
+  const previous = compareState; compareState = normalizeGhostCompare({ ...DEFAULT_GHOST_COMPARE, enabled: previous.enabled }, { differenceAvailable: ghostCompareDifferenceAvailable() });
+  renderGhostCompare(); if (ghostCompareChanged(previous, compareState)) pushHistory();
+}
+
+function releaseCompareInteraction({ restore = false } = {}) {
+  if (compareSplitPointerId !== null && ghostCompareDivider?.hasPointerCapture(compareSplitPointerId)) ghostCompareDivider.releasePointerCapture(compareSplitPointerId);
+  if (restore && compareSplitBefore) compareState = { ...compareSplitBefore };
+  compareSplitPointerId = null; compareSplitBefore = null; compareSplitRect = null; renderGhostCompare();
+}
+
+function updateCompareSplitFromPointer(event) {
+  if (compareSplitPointerId !== event.pointerId || !compareSplitRect) return;
+  const ratio = compareState.splitOrientation === "horizontal"
+    ? (event.clientY - compareSplitRect.top) / compareSplitRect.height
+    : (event.clientX - compareSplitRect.left) / compareSplitRect.width;
+  compareState = normalizeGhostCompare({ ...compareState, splitPosition: ratio }); renderGhostCompare();
+}
+function finishCompareSplit(event, cancelled = false) {
+  if (compareSplitPointerId !== event.pointerId) return;
+  if (cancelled) releaseCompareInteraction({ restore: true });
+  else { if (ghostCompareDivider.hasPointerCapture(event.pointerId)) ghostCompareDivider.releasePointerCapture(event.pointerId); const changed = ghostCompareChanged(compareSplitBefore, compareState); compareSplitPointerId = null; compareSplitRect = null; compareSplitBefore = null; if (changed) pushHistory(); renderGhostCompare(); }
+}
+ghostCompareDivider?.addEventListener("pointerdown", event => {
+  if (!compareState.enabled || compareState.mode !== "split" || !stage?.clientWidth || !stage?.clientHeight) return;
+  event.preventDefault(); event.stopPropagation(); compareSplitPointerId = event.pointerId; compareSplitBefore = { ...compareState }; compareSplitRect = stage.getBoundingClientRect(); ghostCompareDivider.setPointerCapture(event.pointerId);
+});
+ghostCompareDivider?.addEventListener("pointermove", updateCompareSplitFromPointer);
+ghostCompareDivider?.addEventListener("pointerup", event => finishCompareSplit(event));
+ghostCompareDivider?.addEventListener("pointercancel", event => finishCompareSplit(event, true));
+ghostCompareDivider?.addEventListener("keydown", event => {
+  if (!compareState.enabled || compareState.mode !== "split") return;
+  const increment = event.shiftKey ? .05 : .01; let delta = 0;
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") delta = increment;
+  if (event.key === "ArrowLeft" || event.key === "ArrowUp") delta = -increment;
+  if (event.key === "Home") compareState = { ...compareState, splitPosition: 0 };
+  else if (event.key === "End") compareState = { ...compareState, splitPosition: 1 };
+  else if (delta) compareState = normalizeGhostCompare({ ...compareState, splitPosition: compareState.splitPosition + delta });
+  else return;
+  event.preventDefault(); renderGhostCompare(); pushHistory();
+});
+
 function renderOverlay() {
   if (!overlay) return;
-  const flip = flipped ? -1 : 1;
+  const ghost = normalizeGhostOverlay({ ...activeLayer()?.ghost, enabled: !overlay.hidden, imageRef: workspaceImage, x, y, scale, rotation, opacity, locked: locks.position }, { viewportWidth: stage?.clientWidth, viewportHeight: stage?.clientHeight });
+  x = ghost.x; y = ghost.y; scale = ghost.scale; rotation = ghost.rotation; opacity = ghost.opacity;
   const trace = activeLayer()?.trace; const emphasis = Math.max(0, Math.min(1, Number(trace?.settings?.overlayEmphasis ?? .5))); const readabilityMode = trace?.settings?.readabilityMode || "blend"; const overlayFactor = readabilityMode === "camera" ? 0 : readabilityMode === "overlay" ? 1 : emphasis; overlay.style.opacity = opacity * (trace?.enabled ? (trace.settings?.assistOpacity ?? 1) : 1) * overlayFactor; if (camera) camera.style.opacity = readabilityMode === "overlay" ? "0" : "1";
-  overlay.style.transform = `translate(${x}px, ${y}px) scale(${scale * flip}, ${scale}) rotate(${rotation}deg)`;
+  overlay.style.transform = ghostOverlayCssTransform(ghost, { flip: flipped, viewportWidth: stage?.clientWidth, viewportHeight: stage?.clientHeight });
   if (opacityOutput) opacityOutput.textContent = `${Math.round(opacity * 100)}%`;
   if (opacityValue) opacityValue.textContent = `${Math.round(opacity * 100)}%`;
   if (scaleOutput) scaleOutput.textContent = `${Math.round(scale * 100)}%`;
@@ -482,7 +820,7 @@ function renderOverlay() {
   if (perspectiveOverlay && !perspectiveOverlay.hidden) perspectiveOverlay.style.opacity = opacity;
   applyBlendMode(overlay, blendModeInput?.value || "Normal");
   applyBlendMode(perspectiveOverlay, blendModeInput?.value || "Normal");
-  renderLayers(); renderRegionOverlay();
+  renderLayers(); renderRegionOverlay(); renderGhostCompare(); renderGhostBrush();
 }
 
 function setFreezeCamera(enabled) {
@@ -503,27 +841,30 @@ function setFreezeCamera(enabled) {
 
 function captureCurrentDrawing() {
   const source = freezeCamera ? freezeFrame : camera; if (!source?.videoWidth && !source?.width) { status.textContent = "Camera is not ready for capture."; return null; }
-  const canvas = document.createElement("canvas"); canvas.width = source.videoWidth || source.width; canvas.height = source.videoHeight || source.height; canvas.getContext("2d")?.drawImage(source, 0, 0, canvas.width, canvas.height); finishedDrawingImage = canvas.toDataURL("image/jpeg", .9); updateComparisonUI(); if (comparisonStatus) comparisonStatus.textContent = "Finished drawing captured. Ready to compare."; addTimeline("Captured", "Finished drawing"); return finishedDrawingImage;
+  const canvas = document.createElement("canvas"); canvas.width = source.videoWidth || source.width; canvas.height = source.videoHeight || source.height; canvas.getContext("2d")?.drawImage(source, 0, 0, canvas.width, canvas.height); finishedDrawingImage = canvas.toDataURL("image/jpeg", .9); compareDifferenceResult = null; updateComparisonUI(); if (comparisonStatus) comparisonStatus.textContent = "Finished drawing captured. Ready to compare."; addTimeline("Captured", "Finished drawing"); if (compareState.enabled) prepareGhostDifference(); return finishedDrawingImage;
 }
 
-function updateComparisonUI() { if (compareDrawingButton) compareDrawingButton.disabled = !finishedDrawingImage; if (comparisonStatus && !finishedDrawingImage) comparisonStatus.textContent = "No finished drawing captured."; }
+function updateComparisonUI() { if (compareDrawingButton) compareDrawingButton.disabled = !workspaceImage; if (comparisonStatus && !finishedDrawingImage) comparisonStatus.textContent = "No finished drawing captured."; updateGhostCompareControls(); }
 
 function loadImageData(source) { return new Promise((resolve, reject) => { if (!source) return reject(new Error("Missing image source")); const image = new Image(); image.onload = () => { const canvas = document.createElement("canvas"); canvas.width = image.naturalWidth || image.width; canvas.height = image.naturalHeight || image.height; const context = canvas.getContext("2d"); if (!context) return reject(new Error("Canvas processing is unavailable")); context.drawImage(image, 0, 0, canvas.width, canvas.height); resolve(context.getImageData(0, 0, canvas.width, canvas.height)); }; image.onerror = () => reject(new Error("Could not decode comparison image")); image.src = source; }); }
 
 async function compareFinishedDrawing() {
   if (!finishedDrawingImage || !activeLayer()?.image) { status.textContent = "Capture a finished drawing before comparing."; return; }
-  try { const result = compareImageData(await loadImageData(activeLayer().image), await loadImageData(finishedDrawingImage)); if (result.status !== "complete" || !comparisonOverlay) throw new Error("Comparison requires two valid images."); comparisonOverlay.width = result.width; comparisonOverlay.height = result.height; comparisonOverlay.getContext("2d")?.putImageData(new ImageData(result.diff.data, result.width, result.height), 0, 0); comparisonOverlay.hidden = false; comparisonActive = true; overlay.classList.add("comparison-hidden"); perspectiveOverlay.classList.add("comparison-hidden"); compareDrawingButton.textContent = "Hide comparison"; if (comparisonStatus) comparisonStatus.textContent = comparisonSummary(result); transitionAppState("Comparing", "finished drawing comparison"); } catch (error) { if (comparisonStatus) comparisonStatus.textContent = "Comparison failed · capture a clearer finished drawing."; status.textContent = "Could not compare those images."; console.error("[TraceLens comparison] failed", error); }
+  setGhostCompareEnabled(true); const result = await prepareGhostDifference(); if (result) setGhostCompareMode("difference"); else setGhostCompareMode("split");
 }
 
-function clearFinishedComparison() { comparisonActive = false; comparisonOverlay.hidden = true; overlay.classList.remove("comparison-hidden"); perspectiveOverlay.classList.remove("comparison-hidden"); if (compareDrawingButton) compareDrawingButton.textContent = "Compare drawing"; transitionAppState(workspaceImage ? "Reviewing" : "Home", "comparison closed"); }
+function clearFinishedComparison() { setGhostCompareEnabled(false); }
 
-function captureState() { return { x, y, scale, rotation, opacity, flipped, freezeCamera, blendMode: blendModeInput?.value || "Normal", guide: guideInput?.value || "none", physicalCalibration }; }
+function captureState() { return { x, y, scale, rotation, opacity, flipped, freezeCamera, blendMode: blendModeInput?.value || "Normal", guide: guideInput?.value || "none", physicalCalibration, compare: { ...compareState }, ghostBrush: { ...ghostBrushState } }; }
 function captureLayers() { syncActiveLayer(); return cloneLayers(layers); }
 function applyState(next) {
   if (!next) return;
-  x = Number(next.x) || 0; y = Number(next.y) || 0; scale = Number(next.scale) || 1; rotation = Number(next.rotation) || 0; opacity = Number(next.opacity) || .55; flipped = Boolean(next.flipped); setFreezeCamera(Boolean(next.freezeCamera));
+  const safeNumber = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+  x = safeNumber(next.x, 0); y = safeNumber(next.y, 0); scale = Math.max(.25, Math.min(3, Math.abs(safeNumber(next.scale, 1)))); rotation = Math.max(-180, Math.min(180, safeNumber(next.rotation, 0))); opacity = Math.max(.05, Math.min(1, safeNumber(next.opacity, .55))); flipped = Boolean(next.flipped); setFreezeCamera(Boolean(next.freezeCamera));
   if (blendModeInput) blendModeInput.value = next.blendMode || "Normal"; if (guideInput) guideInput.value = next.guide || "none"; guides.setMode(next.guide || "none");
   physicalCalibration = next.physicalCalibration || null;
+  compareState = normalizeGhostCompare(next.compare || DEFAULT_GHOST_COMPARE, { differenceAvailable: ghostCompareDifferenceAvailable() });
+  ghostBrushState = normalizeGhostBrush(next.ghostBrush || DEFAULT_GHOST_BRUSH); ghostBrushPointer = null; ghostBrushPointerActive = false; ghostBrushPointerId = null; ghostBrushTrail = [];
   if (opacityInput) opacityInput.value = opacity; if (scaleInput) scaleInput.value = scale; if (rotationInput) rotationInput.value = rotation; renderOverlay(); renderLayerList();
 }
 function historySourceId(image) { if (!image) return null; if (!historySourceIds.has(image)) { const id = `source-${historySourceIds.size + 1}`; historySourceIds.set(image, id); historySources.set(id, image); } return historySourceIds.get(image); }
@@ -531,13 +872,16 @@ function workspaceState() { syncActiveLayer(); return { layers: layers.map(layer
 function pushHistory() { if (workspaceImage && !historyRestoring) history.push(workspaceState()); }
 function restoreWorkspaceState(next) { if (!next) return; historyRestoring = true; try { if (Array.isArray(next.layers) && next.layers.length) { const restored = next.layers.map(layer => ({ ...layer, image: layer.image || historySources.get(layer.sourceId) })).filter(layer => layer.image); setLayers(restored, next.activeLayerId); } applyState(next); applyLocks(next.locks || activeLayer()?.locks || {}); updateContext(); } finally { historyRestoring = false; } }
 function addTimeline(type, detail = "") { timeline.add(type, detail); recordSession(type, { detail }); const latest = timeline.latest(); if (timelineOutput) timelineOutput.textContent = latest ? `${latest.type}${latest.detail ? ` · ${latest.detail}` : ""}` : "Session ready."; }
-function applyLocks(saved = {}) { Object.keys(locks).forEach(key => { if (typeof locks[key] === "boolean") locks[key] = Boolean(saved[key]); const input = document.querySelector(`[data-lock="${key}"]`); if (input) input.checked = locks[key]; }); stage?.classList.toggle("locked", locks.position); if (layerLock) { layerLock.textContent = locks.position ? "♙" : "♧"; layerLock.setAttribute("aria-label", locks.position ? "Unlock overlay" : "Lock overlay"); } }
+function applyLocks(saved = {}) { Object.keys(locks).forEach(key => { if (typeof locks[key] === "boolean") locks[key] = Boolean(saved[key]); const input = document.querySelector(`[data-lock="${key}"]`); if (input) input.checked = locks[key]; }); stage?.classList.toggle("locked", locks.position); if (layerLock) { layerLock.textContent = locks.position ? "♙" : "♧"; layerLock.setAttribute("aria-label", locks.position ? "Unlock Ghost Overlay adjustment" : "Lock Ghost Overlay adjustment"); } }
 function applyProject(project) {
-  const projectImage = project?.image || project?.layers?.find(layer => layer?.image)?.image;
+  const projectLayers = Array.isArray(project?.layers) ? project.layers.filter(layer => validImageSource(layer?.image)) : [];
+  const projectImage = validImageSource(project?.image) ? project.image : projectLayers[0]?.image;
   if (!projectImage) { status.textContent = "That project has no usable reference image."; return false; }
+  projectOperationToken += 1; imageImportToken += 1; if (pendingImageReader) { try { pendingImageReader.abort(); } catch {} pendingImageReader = null; }
+  releaseGhostInteraction(); releaseCompareInteraction({ restore: true }); releaseGhostBrushInteraction({ clearTrail: true }); compareDifferenceToken += 1; compareDifferenceResult = null; ghostBrushPointer = null; ghostBrushPointerActive = false; ghostBrushPointerId = null; ghostBrushTrail = [];
   traceQueue?.cancel(); traceEngine.cancel(); traceEngine.clearSources(); traceResults.clear(); history.clear(); historySources.clear(); historySourceIds.clear();
   currentProjectId = project.id || null; finishedDrawingImage = project.finishedDrawingImage || null; sessionReplay = createSessionState(project.session); updateComparisonUI(); projectNameInput.value = project.name || "Untitled project"; emptyState.style.display = "none"; layerCard.hidden = false; selectionFrame.classList.add("visible"); showOverlayTools();
-  const restoredLayers = Array.isArray(project.layers) && project.layers.length ? project.layers : [legacyLayer(project, project.name || "Reference image")];
+  const restoredLayers = projectLayers.length ? projectLayers : [legacyLayer({ ...project, image: projectImage }, project.name || "Reference image")];
   setLayers(restoredLayers, project.activeLayerId || restoredLayers.at(-1).id);
   if (project.preset) { presetInput.value = project.preset; applyPreset(project.preset, false); } applyState(project); applyLocks(project.locks); updateContext(); pushHistory(); surfaceTracker.start(camera); queueVisibleTraceLayers(); return true;
 }
@@ -566,22 +910,44 @@ function saveWorkspace() {
     status.textContent = "Import an image before saving a workspace.";
     return;
   }
-  localStorage.setItem(WORKSPACE_KEY, JSON.stringify({ image: workspaceImage, layers: captureLayers(), activeLayerId, session: sessionReplay, ...captureState() }));
-  workspaceButton.classList.add("saved");
-  status.textContent = "Workspace saved on this device.";
-  window.setTimeout(() => workspaceButton.classList.remove("saved"), 900);
+  try {
+    localStorage.setItem(WORKSPACE_KEY, JSON.stringify({ image: workspaceImage, layers: captureLayers(), activeLayerId, session: sessionReplay, ...captureState() }));
+    workspaceButton.classList.add("saved");
+    status.textContent = "Workspace saved on this device.";
+    window.setTimeout(() => workspaceButton.classList.remove("saved"), 900);
+  } catch (error) {
+    status.textContent = "This browser could not save the workspace. Export the project instead.";
+    console.warn("[TraceLens workspace] save failed", error);
+  }
 }
 
 async function saveProject() {
+  if (!workspaceImage) { status.textContent = "Import an image before saving a project."; return false; }
+  const operation = ++projectOperationToken;
+  pendingSaveCount += 1;
+  recordBetaEvent("save-start", { generation: operation });
   transitionAppState("Saving", "project save");
-  if (!workspaceImage) { status.textContent = "Import an image before saving a project."; return; }
   const name = projectNameInput.value.trim() || "Untitled project";
   currentProjectId ||= globalThis.crypto?.randomUUID?.() || `project-${Date.now()}`;
-  const savedLayers = captureLayers(); await Promise.all(savedLayers.map(async layer => { if (!layer.thumbnail) layer.thumbnail = await projectLibrary.thumbnail(layer.image); }));
-  await projectLibrary.put({ id: currentProjectId, name, image: workspaceImage, layers: savedLayers, activeLayerId, finishedDrawingImage, session: sessionReplay, preset: presetInput.value, perspective: surfaceTracker.locked ? activePerspectiveQuad : null, perspectiveLocked: surfaceTracker.locked, ...captureState(), locks: { ...locks }, updatedAt: Date.now(), thumbnail: await projectLibrary.thumbnail(workspaceImage) });
-  await refreshProjectList(); addTimeline("Saved", name);
-  status.textContent = `Project “${name}” saved.`;
-  transitionAppState(workspaceImage ? "Tracing" : "Home", "project saved");
+  const projectId = currentProjectId; const savedLayers = captureLayers();
+  try {
+    await Promise.all(savedLayers.map(async layer => { if (!layer.thumbnail) layer.thumbnail = await projectLibrary.thumbnail(layer.image); }));
+    const thumbnail = await projectLibrary.thumbnail(workspaceImage);
+    if (operation !== projectOperationToken || currentProjectId !== projectId || !workspaceImage) return false;
+    await projectLibrary.put({ id: projectId, name, image: workspaceImage, layers: savedLayers, activeLayerId, finishedDrawingImage, session: sessionReplay, preset: presetInput.value, perspective: surfaceTracker.locked ? activePerspectiveQuad : null, perspectiveLocked: surfaceTracker.locked, ...captureState(), locks: { ...locks }, updatedAt: Date.now(), thumbnail });
+    if (operation !== projectOperationToken) return false;
+    lastPersistenceResult = "success";
+    recordBetaEvent("save-success", { generation: operation });
+    await refreshProjectList(); addTimeline("Saved", name);
+    status.textContent = `Project “${name}” saved.`;
+    transitionAppState(workspaceImage ? "Tracing" : "Home", "project saved");
+    return true;
+  } catch (error) {
+    if (operation === projectOperationToken) { lastPersistenceResult = "failure"; recordBetaEvent("save-failure", { generation: operation, reason: "storage" }); betaDiagnostics.error("Project save failed", { source: "storage" }); status.textContent = "Project could not be saved. Export the project instead."; transitionAppState(workspaceImage ? "Tracing" : "Home", "project save failed"); }
+    throw error;
+  } finally {
+    pendingSaveCount = Math.max(0, pendingSaveCount - 1);
+  }
 }
 
 async function restoreLatestProject() {
@@ -592,9 +958,12 @@ async function restoreLatestProject() {
 function restoreWorkspace() {
   try {
     const saved = JSON.parse(localStorage.getItem(WORKSPACE_KEY));
-    if (!saved?.image) return;
+    const savedLayers = Array.isArray(saved.layers) ? saved.layers.filter(layer => validImageSource(layer?.image)) : [];
+    const savedImage = validImageSource(saved?.image) ? saved.image : savedLayers[0]?.image;
+    if (!savedImage) return;
+    projectOperationToken += 1; imageImportToken += 1; if (pendingImageReader) { try { pendingImageReader.abort(); } catch {} pendingImageReader = null; }
     traceQueue?.cancel(); traceEngine.cancel(); traceEngine.clearSources(); traceResults.clear(); history.clear(); historySources.clear(); historySourceIds.clear();
-    const restoredLayers = Array.isArray(saved.layers) && saved.layers.length ? saved.layers : [legacyLayer(saved, "Saved workspace")];
+    const restoredLayers = savedLayers.length ? savedLayers : [legacyLayer({ ...saved, image: savedImage }, "Saved workspace")];
     currentProjectId = null; sessionReplay = createSessionState(saved.session); emptyState.style.display = "none"; layerCard.hidden = false; selectionFrame.classList.add("visible"); showOverlayTools(); setLayers(restoredLayers, saved.activeLayerId || restoredLayers.at(-1).id);
     applyState(saved); status.textContent = "Saved workspace restored.";
     addTimeline("Restored", "Workspace");
@@ -604,34 +973,64 @@ function restoreWorkspace() {
 }
 
 async function startCamera() {
+  const request = ++cameraRequestToken;
+  cameraRequestPending = true;
+  recordBetaEvent("camera-request", { generation: request, facingMode: cameraFacing });
   try {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error("Camera access is not supported.");
     if (stream) stream.getTracks().forEach(track => track.stop());
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: cameraFacing } }, audio: false });
-    camera.srcObject = stream;
+    surfaceTracker.stop(); traceHandTracker.stop(); stream = null; camera.srcObject = null;
+    const nextStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: cameraFacing } }, audio: false });
+    if (request !== cameraRequestToken) { nextStream.getTracks().forEach(track => track.stop()); recordBetaEvent("stale-camera-rejection", { generation: request }); return null; }
+    stream = nextStream; camera.srcObject = stream; cameraState.textContent = "CAMERA STARTING";
+    await waitForVideoMetadata(camera);
+    if (request !== cameraRequestToken) { nextStream.getTracks().forEach(track => track.stop()); recordBetaEvent("stale-camera-rejection", { generation: request }); return null; }
     stream.getTracks().forEach(track => track.addEventListener("ended", () => {
-      if (camera.srcObject === stream) { cameraState.textContent = "CAMERA STOPPED"; status.textContent = "Camera stopped. Tap restart to try again."; }
+      if (request === cameraRequestToken && camera.srcObject === stream) { cameraState.textContent = "CAMERA STOPPED"; status.textContent = "Camera stopped. Tap restart to try again."; }
     }));
     camera.classList.toggle("selfie-camera", cameraFacing === "user");
     cameraState.textContent = "CAMERA ACTIVE";
+    recordBetaEvent("camera-success", { generation: request, facingMode: cameraFacing, videoWidth: camera.videoWidth || 0, videoHeight: camera.videoHeight || 0 });
     status.textContent = "Camera active.";
     if (freezeCamera) setFreezeCamera(true);
     if (workspaceImage) surfaceTracker.start(camera);
     return stream;
   } catch (error) {
+    if (request !== cameraRequestToken) return null;
     cameraState.textContent = "CAMERA UNAVAILABLE";
     if (stream) { stream.getTracks().forEach(track => track.stop()); stream = null; }
-    const classified = classifyCameraError(error); status.textContent = classified.message; console.error("[TraceLens camera]", classified.code, error); throw Object.assign(error instanceof Error ? error : new Error(classified.message), { cameraCode: classified.code });
+    const classified = classifyCameraError(error); recordBetaEvent("camera-rejection", { code: classified.code }); betaDiagnostics.error(classified.message, { source: "camera", code: classified.code }); status.textContent = classified.message; console.error("[TraceLens camera]", classified.code, error); throw Object.assign(error instanceof Error ? error : new Error(classified.message), { cameraCode: classified.code });
+  } finally {
+    if (request === cameraRequestToken) cameraRequestPending = false;
   }
+}
+
+function stopCamera({ clearVideo = true } = {}) {
+  cameraRequestToken += 1;
+  cameraRequestPending = false;
+  if (stream) stream.getTracks().forEach(track => track.stop());
+  stream = null;
+  surfaceTracker.stop();
+  traceHandTracker.stop();
+  if (clearVideo && camera) camera.srcObject = null;
+  if (cameraState) cameraState.textContent = "CAMERA PAUSED";
+  recordBetaEvent("stream-stop", { clearVideo });
 }
 
 function loadImage(file) {
   if (!file) return;
+  recordBetaEvent("image-import-start", { size: Number(file.size) || 0, type: file.type || "unknown" });
+  const importRequest = ++imageImportToken;
+  projectOperationToken += 1;
+  if (pendingImageReader) { try { pendingImageReader.abort(); } catch {} pendingImageReader = null; }
   if (!file.type?.startsWith("image/")) { status.textContent = "Choose a supported image file."; return; }
   if (file.size > 25 * 1024 * 1024) { status.textContent = "That image is larger than 25 MB. Choose a smaller file."; return; }
+  releaseGhostInteraction(); releaseCompareInteraction({ restore: true }); releaseGhostBrushInteraction({ clearTrail: true }); compareDifferenceToken += 1; compareDifferenceResult = null; compareState = normalizeGhostCompare({ ...compareState, enabled: false });
   transitionAppState("Importing", "image selected");
-  const reader = new FileReader();
+  const reader = new FileReader(); pendingImageReader = reader;
   reader.onload = () => {
+    if (importRequest !== imageImportToken) { recordBetaEvent("stale-import-rejection", { generation: importRequest }); return; }
+    pendingImageReader = null;
     transitionAppState("PreparingImage", "image decoded");
     snapController.clear();
     perspectiveActive = false;
@@ -651,11 +1050,12 @@ function loadImage(file) {
     if (gestureHint) gestureHint.hidden = false;
     sessionReplay = startSession(sessionReplay); addTimeline("Imported", file.name); gestureCoach.show();
     status.textContent = "Overlay loaded. Drag, pinch, or rotate to position it.";
+    recordBetaEvent("image-import-success", { size: Number(file.size) || 0 });
     updateContext();
     surfaceTracker.start(camera);
     transitionAppState("Positioning", "reference ready");
   };
-  reader.onerror = () => { transitionAppState("Error", "image read failed"); status.textContent = "Could not read that image. Try another file."; console.error("[TraceLens import] FileReader failed", reader.error); };
+  reader.onerror = () => { if (importRequest !== imageImportToken) return; pendingImageReader = null; recordBetaEvent("image-import-failure", { reason: "read-failed" }); betaDiagnostics.error("Could not read image", { source: "image-import" }); transitionAppState("Error", "image read failed"); status.textContent = "Could not read that image. Try another file."; console.error("[TraceLens import] FileReader failed", reader.error); };
   reader.readAsDataURL(file);
 }
 
@@ -691,7 +1091,22 @@ cameraButton?.addEventListener("click", () => startCamera().catch(() => {}));
 cameraFacingButton?.addEventListener("click", () => { cameraFacing = cameraFacing === "environment" ? "user" : "environment"; globalThis.localStorage?.setItem("tracelens-camera-facing", cameraFacing); startCamera().catch(() => {}); });
 freezeCameraButton?.addEventListener("click", () => { setFreezeCamera(!freezeCamera); pushHistory(); status.textContent = freezeCamera ? "Camera frame frozen." : "Live camera restored."; });
 captureDrawingButton?.addEventListener("click", () => captureCurrentDrawing());
-compareDrawingButton?.addEventListener("click", () => { if (comparisonActive) clearFinishedComparison(); else compareFinishedDrawing(); });
+compareDrawingButton?.addEventListener("click", () => { if (compareState.enabled) clearFinishedComparison(); else compareFinishedDrawing(); });
+compareButton?.addEventListener("click", () => setGhostCompareEnabled(!compareState.enabled));
+ghostCompareExitButton?.addEventListener("click", () => setGhostCompareEnabled(false));
+ghostCompareResetButton?.addEventListener("click", resetGhostCompare);
+ghostComparePanel?.addEventListener("click", event => { const button = event.target.closest("[data-compare-mode]"); if (button && !button.disabled) setGhostCompareMode(button.dataset.compareMode); });
+ghostCompareBlendInput?.addEventListener("input", event => { compareState = normalizeGhostCompare({ ...compareState, blend: event.target.value }); renderGhostCompare(); });
+ghostCompareBlendInput?.addEventListener("change", () => pushHistory());
+ghostCompareSplitInput?.addEventListener("input", event => { compareState = normalizeGhostCompare({ ...compareState, splitPosition: event.target.value }); renderGhostCompare(); });
+ghostCompareSplitInput?.addEventListener("change", () => pushHistory());
+ghostBrushToggleButton?.addEventListener("click", () => setGhostBrushState({ ...ghostBrushState, enabled: !ghostBrushState.enabled }, { commit: true }));
+ghostBrushResetButton?.addEventListener("click", resetGhostBrush);
+ghostBrushModeInput?.addEventListener("change", event => setGhostBrushState({ ...ghostBrushState, mode: event.target.value }, { commit: true }));
+const ghostBrushSliderMap = [[ghostBrushRadiusInput, "radius"], [ghostBrushFeatherInput, "feather"], [ghostBrushOutsideInput, "outsideOpacity"], [ghostBrushEdgeInput, "edgeStrength"], [ghostBrushTrailInputRange, "trailLength"]];
+ghostBrushSliderMap.forEach(([input, key]) => { input?.addEventListener("input", event => setGhostBrushState({ ...ghostBrushState, [key]: event.target.value })); input?.addEventListener("change", () => pushHistory()); });
+ghostBrushTrailInput?.addEventListener("change", event => setGhostBrushState({ ...ghostBrushState, trailEnabled: event.target.checked }, { commit: true }));
+ghostBrushEndpointInput?.addEventListener("change", event => setGhostBrushState({ ...ghostBrushState, followEndpoint: event.target.checked }, { commit: true }));
 gridButton?.addEventListener("click", () => { grid.classList.toggle("visible"); gridButton.classList.toggle("active"); });
 flipButton?.addEventListener("click", () => { flipped = !flipped; flipButton.classList.toggle("active", flipped); renderOverlay(); });
 adjustButton?.addEventListener("click", () => { const opening = !adjustSheet.classList.contains("open"); if (opening) lastAdjustFocus = document.activeElement; setTraceSheet(opening ? "expanded" : "closed", "normal"); if (!opening && lastAdjustFocus?.focus) lastAdjustFocus.focus(); });
@@ -705,7 +1120,7 @@ presetChips?.addEventListener("click", event => { const button = event.target.cl
 projectSearchInput?.addEventListener("input", debouncedProjectSearch);
 projectSortInput?.addEventListener("change", refreshProjectList);
 saveProjectButton?.addEventListener("click", () => { saveProject().catch(error => { status.textContent = "Project storage unavailable."; console.warn(error); }); });
-loadProjectButton?.addEventListener("click", async () => { try { const project = await projectLibrary.get(projectList.value); if (project) { applyProject(project); addTimeline("Loaded", project.name || "Project"); status.textContent = `Project “${project.name || "Project"}” loaded.`; } } catch (error) { status.textContent = "That project could not be loaded. It may be corrupted."; console.error("[TraceLens projects] load failed", error); } });
+loadProjectButton?.addEventListener("click", async () => { pendingProjectLoadCount += 1; try { const project = await projectLibrary.get(projectList.value); if (project) { applyProject(project); addTimeline("Loaded", project.name || "Project"); status.textContent = `Project “${project.name || "Project"}” loaded.`; } } catch (error) { status.textContent = "That project could not be loaded. It may be corrupted."; console.error("[TraceLens projects] load failed", error); } finally { pendingProjectLoadCount = Math.max(0, pendingProjectLoadCount - 1); } });
 duplicateProjectButton?.addEventListener("click", async () => { const project = await projectLibrary.get(projectList.value); if (!project) return; currentProjectId = globalThis.crypto?.randomUUID?.() || `project-${Date.now()}`; projectNameInput.value = `${project.name} copy`; await saveProject(); await refreshProjectList(); });
 favoriteProjectButton?.addEventListener("click", async () => { if (!projectList.value) return; const project = await projectLibrary.get(projectList.value); if (project) { await projectLibrary.patch(project.id, { favorite: !project.favorite }); await refreshProjectList(); } });
 deleteProjectButton?.addEventListener("click", async () => { if (!projectList.value) return; if (window.confirm("Archive this project?")) { await projectLibrary.patch(projectList.value, { archived: true }); await refreshProjectList(); status.textContent = "Project archived on this device."; } });
@@ -726,7 +1141,7 @@ traceGuideEnabledInput?.addEventListener("change", async event => { const layer 
 traceGuidePauseButton?.addEventListener("click", () => { if (traceGuide.state.running) traceGuide.pause(); else traceGuide.resume(); const layer = activeLayer(); if (layer) layer.trace.guide = normalizeGuideState(traceGuide.state); pushHistory(); });
 traceGuideNextButton?.addEventListener("click", nextTraceGuideContour);
 [traceGuideModeInput, traceGuideToleranceInput, traceGuideSmoothingInput].forEach(input => input?.addEventListener("change", () => { const layer = activeLayer(); if (!layer) return; traceGuide.setSettings({ mode: traceGuideModeInput?.value, tolerance: traceGuideToleranceInput?.value, smoothing: traceGuideSmoothingInput?.value }); layer.trace.guide = normalizeGuideState(traceGuide.state); pushHistory(); }));
-diagnosticsInput?.addEventListener("change", event => { diagnosticsOutput.hidden = !event.target.checked; updateContext(); });
+diagnosticsInput?.addEventListener("change", event => { diagnosticsOutput.hidden = !event.target.checked; recordBetaEvent("diagnostics-toggled", { enabled: event.target.checked }); updateContext(); });
 document.querySelectorAll("[data-lock]").forEach(input => input.addEventListener("change", event => { locks.toggle(event.target.dataset.lock); status.textContent = `${event.target.dataset.lock} ${event.target.checked ? "locked" : "unlocked"}.`; pushHistory(); }));
 autoOpacityInput?.addEventListener("change", event => { adaptiveOpacity.setEnabled(event.target.checked); if (event.target.checked) status.textContent = "Auto Opacity active."; });
 autoPerspectiveButton?.addEventListener("click", () => {
@@ -735,8 +1150,8 @@ autoPerspectiveButton?.addEventListener("click", () => {
   autoPerspectiveScanning = true; surfaceTracker.beginScan(); perspectiveSession.beginScan(); surfaceTracker.start(camera); transitionAppState("ScanningSurface", "automatic surface scan"); autoPerspectiveButton.classList.add("active"); visionStatus.textContent = "Scanning surface…"; status.textContent = "Scanning surface. Hold steady."; updateContext();
 });
 manualPerspectiveButton?.addEventListener("click", () => { surfaceTracker.unlock(); surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; activePerspectiveQuad = [{ x: .08, y: .08 }, { x: .92, y: .08 }, { x: .92, y: .92 }, { x: .08, y: .92 }]; perspectiveActive = true; transitionAppState("Calibrating", "manual four-corner calibration"); autoPerspectiveButton.classList.remove("active"); overlay.style.display = "none"; snapController.snap(activeRenderSource(), perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight), stage.clientWidth, stage.clientHeight, opacity); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; syncActiveLayer(); pushHistory(); status.textContent = "Manual mode · adjust corners."; visionStatus.textContent = "Manual mode"; updateContext(); });
-layerVisibility?.addEventListener("click", () => { overlay.hidden = !overlay.hidden; const layer = activeLayer(); if (layer) layer.visible = !overlay.hidden; restoreLayerVisibility(layer); layerVisibility.textContent = overlay.hidden ? "⊘" : "◉"; layerVisibility.setAttribute("aria-label", overlay.hidden ? "Show overlay" : "Hide overlay"); pushHistory(); });
-layerLock?.addEventListener("click", () => { locks.toggle("position"); const layer = activeLayer(); if (layer) layer.locked = locks.position; stage.classList.toggle("locked", locks.position); layerLock.textContent = locks.position ? "♙" : "♧"; layerLock.setAttribute("aria-label", locks.position ? "Unlock overlay" : "Lock overlay"); pushHistory(); });
+layerVisibility?.addEventListener("click", () => { overlay.hidden = !overlay.hidden; const layer = activeLayer(); if (layer) layer.visible = !overlay.hidden; restoreLayerVisibility(layer); layerVisibility.textContent = overlay.hidden ? "⊘" : "◉"; layerVisibility.setAttribute("aria-label", overlay.hidden ? "Enable Ghost Overlay" : "Disable Ghost Overlay"); pushHistory(); });
+layerLock?.addEventListener("click", () => { locks.toggle("position"); const layer = activeLayer(); if (layer) layer.locked = locks.position; stage.classList.toggle("locked", locks.position); layerLock.textContent = locks.position ? "♙" : "♧"; layerLock.setAttribute("aria-label", locks.position ? "Unlock Ghost Overlay adjustment" : "Lock Ghost Overlay adjustment"); pushHistory(); });
 layerAdd?.addEventListener("click", () => dockImageInput?.click());
 quickTraceModeButton?.addEventListener("click", () => setTraceSheet("peek", "trace"));
 quickTraceExpandButton?.addEventListener("click", () => setTraceSheet(traceSheetState === "expanded" ? "peek" : "expanded", "trace"));
@@ -755,27 +1170,24 @@ layersList?.addEventListener("click", event => {
   if (action.includes("duplicate")) { syncActiveLayer(); const copy = duplicateLayer(layer); layers.splice(layers.indexOf(layer) + 1, 0, copy); setLayers(layers, copy.id); pushHistory(); status.textContent = `${copy.name} duplicated.`; return; }
   if (action.includes("delete")) { if (layers.length === 1) { status.textContent = "Keep at least one reference layer."; return; } if (!window.confirm(`Delete layer “${layer.name}”?`)) return; traceQueue?.cancel(); traceResults.delete(layer.id); traceEngine.clearLayerCache(layer.image); const index = layers.indexOf(layer); layers.splice(index, 1); setLayers(layers, layers[Math.max(0, index - 1)]?.id || layers[0].id); queueVisibleTraceLayers(); pushHistory(); status.textContent = `${layer.name} deleted.`; return; }
   if (action.includes("up") || action.includes("down")) { const index = layers.indexOf(layer); const nextIndex = action.includes("up") ? Math.min(layers.length - 1, index + 1) : Math.max(0, index - 1); if (index !== nextIndex) [layers[index], layers[nextIndex]] = [layers[nextIndex], layers[index]]; renderLayers(true); pushHistory(); return; }
-  if (event.target.closest(".layer-row-main")) { syncActiveLayer(); surfaceTracker.unlock(); perspectiveSession.cancel(); perspectiveActive = false; activePerspectiveQuad = null; layersExpanded = false; layersList.hidden = true; layerCard.classList.remove("layers-expanded"); layersToggle.setAttribute("aria-expanded", "false"); loadLayerState(layer); renderOverlay(); selectionFrame.classList.add("visible"); pushHistory(); status.textContent = `${layer.name} selected.`; }
+  if (event.target.closest(".layer-row-main")) { syncActiveLayer(); releaseCompareInteraction({ restore: true }); compareDifferenceToken += 1; compareDifferenceResult = null; surfaceTracker.unlock(); perspectiveSession.cancel(); perspectiveActive = false; activePerspectiveQuad = null; layersExpanded = false; layersList.hidden = true; layerCard.classList.remove("layers-expanded"); layersToggle.setAttribute("aria-expanded", "false"); loadLayerState(layer); renderOverlay(); selectionFrame.classList.add("visible"); pushHistory(); status.textContent = `${layer.name} selected.`; }
 });
 resetButton?.addEventListener("click", () => { x = 0; y = 0; scale = 1; rotation = 0; opacity = 0.55; flipped = false; opacityInput.value = opacity; scaleInput.value = scale; rotationInput.value = rotation; renderOverlay(); flipButton?.classList.remove("active"); status.textContent = "Overlay position reset."; });
 
-function setComparing(next) {
-  comparing = next;
-  transitionAppState(next ? "Comparing" : (workspaceImage ? "Reviewing" : "Home"), next ? "before comparison" : "comparison closed");
-  overlay.classList.toggle("comparison-hidden", comparing);
-  perspectiveOverlay.classList.toggle("comparison-hidden", comparing);
-  compareButton.classList.toggle("active", comparing);
-  if (comparing) status.textContent = "Before view · release to restore overlay.";
-}
-compareButton?.addEventListener("pointerdown", event => { event.preventDefault(); setComparing(true); compareButton.setPointerCapture(event.pointerId); });
-compareButton?.addEventListener("pointerup", () => setComparing(false));
-compareButton?.addEventListener("pointercancel", () => setComparing(false));
-compareButton?.addEventListener("pointerleave", () => { if (comparing) setComparing(false); });
-
 function distance(a, b) { return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY); }
 function angle(a, b) { return Math.atan2(b.clientY - a.clientY, b.clientX - a.clientX) * 180 / Math.PI; }
+function releaseGhostInteraction({ restore = false } = {}) {
+  window.clearTimeout(longPressTimer);
+  for (const [pointerId] of pointers) if (stage?.hasPointerCapture(pointerId)) stage.releasePointerCapture(pointerId);
+  pointers.clear(); gestureStart = null; dragging = false; perspectiveDragIndex = null;
+  if (restore && ghostGestureStart) { ({ x, y, scale, rotation } = ghostGestureStart); renderOverlay(); }
+  ghostGestureStart = null;
+}
 stage?.addEventListener("pointerdown", event => {
-  if (!overlay.src || (locks.position && locks.rotation && locks.scale && locks.perspective)) return;
+  if (!overlay.src) return;
+  if (!stage.clientWidth || !stage.clientHeight) return;
+  if (ghostBrushPointerId === null && Number.isFinite(event.clientX) && Number.isFinite(event.clientY)) { ghostBrushPointerId = event.pointerId; ghostBrushPointerRect = stage.getBoundingClientRect(); updateGhostBrushPointer(event); }
+  if (locks.position && locks.rotation && locks.scale && locks.perspective) return;
   wakeHUD(); gestureCoach.dismiss();
   const now = performance.now();
   if (now - lastTapAt < 320) { x = 0; y = 0; renderOverlay(); status.textContent = "Overlay centered."; }
@@ -785,29 +1197,61 @@ stage?.addEventListener("pointerdown", event => {
   if (perspectiveActive && handle && locks.canEdit("perspective")) { perspectiveDragIndex = [...selectionFrame.querySelectorAll("i")].indexOf(handle); stage.setPointerCapture(event.pointerId); return; }
   if (!locks.canEdit("position")) return;
   if (perspectiveActive && locks.canEdit("perspective")) { snapController.clear(); perspectiveActive = false; surfaceTracker.unlock(); perspectiveSession.cancel(); overlay.style.display = "block"; autoPerspectiveButton.classList.remove("active"); selectionFrame.classList.remove("surface-found"); selectionFrame.style.clipPath = "none"; status.textContent = "Manual alignment resumed."; updateContext(); }
-  pointers.set(event.pointerId, event); stage.setPointerCapture(event.pointerId);
+  if (pointers.size === 0) ghostGestureStart = { x, y, scale, rotation };
+  pointers.set(event.pointerId, event); stage.setPointerCapture(event.pointerId); event.preventDefault();
   if (pointers.size === 1) { dragging = true; pointerStartX = event.clientX; pointerStartY = event.clientY; originX = x; originY = y; }
   if (pointers.size === 2) { dragging = false; const [a, b] = [...pointers.values()]; gestureStart = { distance: distance(a,b), angle: angle(a,b), scale, rotation }; }
 });
 stage?.addEventListener("pointermove", event => {
-  if (perspectiveActive && perspectiveDragIndex !== null && activePerspectiveQuad) { activePerspectiveQuad[perspectiveDragIndex] = { x: Math.max(0, Math.min(1, event.offsetX / stage.clientWidth)), y: Math.max(0, Math.min(1, event.offsetY / stage.clientHeight)) }; const pixels = perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight); snapController.snap(activeRenderSource(), pixels, stage.clientWidth, stage.clientHeight, opacity); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; return; }
+  if (perspectiveActive && perspectiveDragIndex !== null && activePerspectiveQuad) { if (!stage.clientWidth || !stage.clientHeight) return; activePerspectiveQuad[perspectiveDragIndex] = { x: Math.max(0, Math.min(1, event.offsetX / stage.clientWidth)), y: Math.max(0, Math.min(1, event.offsetY / stage.clientHeight)) }; const pixels = perspectiveSolver.toPixels(activePerspectiveQuad, stage.clientWidth, stage.clientHeight); snapController.snap(activeRenderSource(), pixels, stage.clientWidth, stage.clientHeight, opacity); selectionFrame.style.clipPath = `polygon(${activePerspectiveQuad.map(point => `${point.x * 100}% ${point.y * 100}%`).join(",")})`; return; }
   if (!pointers.has(event.pointerId)) return; pointers.set(event.pointerId, event);
   if (pointers.size === 2 && gestureStart) { const [a,b] = [...pointers.values()]; if (locks.canEdit("scale")) scale = Math.max(.25, Math.min(3, gestureStart.scale * distance(a,b) / gestureStart.distance)); if (locks.canEdit("rotation")) { const rawRotation = gestureStart.rotation + angle(a,b) - gestureStart.angle; rotation = Math.round(rawRotation / 15) * 15; } scaleInput.value = scale; rotationInput.value = rotation; renderOverlay(); return; }
   if (dragging) { x = originX + event.clientX - pointerStartX; y = originY + event.clientY - pointerStartY; renderOverlay(); }
 });
-function endPointer(event) { const wasPerspective = perspectiveDragIndex !== null; perspectiveDragIndex = null; pointers.delete(event.pointerId); if (stage.hasPointerCapture(event.pointerId)) stage.releasePointerCapture(event.pointerId); if (wasPerspective) syncActiveLayer(); if (pointers.size < 2) { gestureStart = null; pushHistory(); } dragging = pointers.size === 1; }
-stage?.addEventListener("pointerup", endPointer); stage?.addEventListener("pointercancel", endPointer);
+stage?.addEventListener("pointermove", event => { if (ghostBrushPointerId === event.pointerId) updateGhostBrushPointer(event); });
+stage?.addEventListener("pointerup", event => { if (ghostBrushPointerId === event.pointerId) releaseGhostBrushInteraction(); });
+stage?.addEventListener("pointercancel", event => { recordBetaEvent("pointer-cancellation", { owner: "stage" }); if (ghostBrushPointerId === event.pointerId) releaseGhostBrushInteraction({ clearTrail: true }); });
+stage?.addEventListener("lostpointercapture", event => { recordBetaEvent("lost-pointer-capture", { owner: "stage" }); if (ghostBrushPointerId === event.pointerId) releaseGhostBrushInteraction({ clearTrail: true }); });
+function endPointer(event, cancelled = false) { const wasPerspective = perspectiveDragIndex !== null; perspectiveDragIndex = null; pointers.delete(event.pointerId); if (stage.hasPointerCapture(event.pointerId)) stage.releasePointerCapture(event.pointerId); if (wasPerspective) syncActiveLayer(); if (cancelled) { releaseGhostInteraction({ restore: true }); return; } if (pointers.size < 2) { gestureStart = null; pushHistory(); ghostGestureStart = null; } dragging = pointers.size === 1; }
+stage?.addEventListener("pointerup", event => endPointer(event)); stage?.addEventListener("pointercancel", event => endPointer(event, true));
 stage?.addEventListener("pointerup", () => window.clearTimeout(longPressTimer));
-stage?.addEventListener("pointercancel", () => { window.clearTimeout(longPressTimer); pointers.clear(); gestureStart = null; dragging = false; });
-window.addEventListener("blur", () => { window.clearTimeout(longPressTimer); pointers.clear(); gestureStart = null; dragging = false; });
+stage?.addEventListener("pointercancel", () => releaseGhostInteraction({ restore: true }));
+window.addEventListener("blur", () => { releaseGhostInteraction({ restore: true }); releaseCompareInteraction({ restore: true }); releaseGhostBrushInteraction({ clearTrail: true }); });
 }
-document.addEventListener("visibilitychange", () => { if (document.hidden) { traceEngine.cancel(); surfaceTracker.stop(); traceGuide.pause(); traceHandTracker.stop(); if (sessionReplay.status === "recording") sessionReplay = pauseSession(sessionReplay); updateSessionUI(); } else if (camera.srcObject && workspaceImage) { surfaceTracker.start(camera); const layer = activeLayer(); if (layer?.trace?.enabled) refreshTraceView(layer); if (layer?.trace?.guide?.enabled) traceGuide.enable(); if (sessionReplay.status === "paused") sessionReplay = resumeSession(sessionReplay); updateSessionUI(); } });
+document.addEventListener("visibilitychange", () => {
+  recordBetaEvent("visibility-change", { state: document.visibilityState });
+  if (document.hidden) {
+    stopVisionLoop();
+    releaseGhostInteraction({ restore: true });
+    releaseCompareInteraction({ restore: true });
+    releaseGhostBrushInteraction({ clearTrail: true });
+    traceEngine.cancel();
+    traceGuide.pause();
+    stopCamera();
+    if (sessionReplay.status === "recording") sessionReplay = pauseSession(sessionReplay);
+    updateSessionUI();
+  } else if (workspaceImage) {
+    startVisionLoop();
+    startCamera().catch(error => console.warn("[TraceLens camera] resume failed", error));
+    if (sessionReplay.status === "paused") sessionReplay = resumeSession(sessionReplay);
+    updateSessionUI();
+  }
+});
+window.addEventListener("pagehide", () => { stopVisionLoop(); releaseGhostInteraction({ restore: true }); releaseCompareInteraction({ restore: true }); releaseGhostBrushInteraction({ clearTrail: true }); stopCamera(); });
 window.addEventListener("keydown", event => { if (event.key === "Escape" && adjustSheet.classList.contains("open")) { closeAdjust.click(); } });
 let visionFrameId = 0;
 let visionLoopStarted = false;
-function requestVisionFrame(now = performance.now()) { diagnostics.frame(); if (workspaceImage && !document.hidden && camera.srcObject) adaptiveOpacity.update(camera, now); diagnostics.render({ appState: appStateMachine.state, tracking: surfaceTracker.state.confidence, camera: camera.videoWidth ? `${camera.videoWidth}×${camera.videoHeight}` : "—", quality: perspectiveActive ? "perspective" : "high", trace: diagnosticsInput?.checked ? traceEngine.diagnostics() : null, ...latestSurfaceDiagnostics }); visionFrameId = requestAnimationFrame(requestVisionFrame); }
-function updateViewportHeight() { const height = globalThis.visualViewport?.height || window.innerHeight; document.documentElement.style.setProperty("--app-viewport-height", `${Math.round(height)}px`); renderRegionOverlay(); }
-updateViewportHeight(); window.addEventListener("resize", updateViewportHeight, { passive: true }); window.visualViewport?.addEventListener("resize", updateViewportHeight, { passive: true }); window.visualViewport?.addEventListener("scroll", updateViewportHeight, { passive: true });
+/**
+ * Lightweight presentation/diagnostics loop. Heavy detection and processing
+ * are cadence-limited elsewhere so the camera interaction remains responsive.
+ */
+function requestVisionFrame(now = performance.now()) { if (!visionLoopStarted) return; diagnostics.frame(); if (workspaceImage && !document.hidden && camera.srcObject) adaptiveOpacity.update(camera, now); diagnostics.render({ appState: appStateMachine.state, tracking: surfaceTracker.state.confidence, camera: camera.videoWidth ? `${camera.videoWidth}×${camera.videoHeight}` : "—", quality: perspectiveActive ? "perspective" : "high", trace: diagnosticsInput?.checked ? traceEngine.diagnostics() : null, ...latestSurfaceDiagnostics }); visionFrameId = requestAnimationFrame(requestVisionFrame); }
+function startVisionLoop() { if (visionLoopStarted || document.hidden) return; visionLoopStarted = true; visionFrameId = requestAnimationFrame(requestVisionFrame); }
+function stopVisionLoop() { visionLoopStarted = false; if (visionFrameId) cancelAnimationFrame(visionFrameId); visionFrameId = 0; }
+function updateViewportHeight() { if (pointers.size) releaseGhostInteraction({ restore: true }); if (compareSplitPointerId !== null) releaseCompareInteraction({ restore: true }); if (ghostBrushPointerActive) { ghostBrushPointerRect = stage?.getBoundingClientRect() || null; } const height = globalThis.visualViewport?.height || window.innerHeight; document.documentElement.style.setProperty("--app-viewport-height", `${Math.max(0, Math.round(height))}px`); const key = `${window.innerWidth}x${Math.round(height)}:${window.screen?.orientation?.type || "unknown"}`; if (key !== lastDiagnosticViewportKey) { lastDiagnosticViewportKey = key; recordBetaEvent("viewport-change", { width: window.innerWidth, height, orientation: window.screen?.orientation?.type }); } renderRegionOverlay(); renderGhostCompare(); renderGhostBrush(); }
+const viewportCoordinator = createViewportCoordinator({ onUpdate: updateViewportHeight });
+viewportCoordinator.schedule();
+window.addEventListener("resize", () => viewportCoordinator.schedule(), { passive: true }); window.visualViewport?.addEventListener("resize", () => viewportCoordinator.schedule(), { passive: true }); window.visualViewport?.addEventListener("scroll", () => viewportCoordinator.schedule(), { passive: true }); window.addEventListener("orientationchange", () => viewportCoordinator.schedule(), { passive: true }); window.screen?.orientation?.addEventListener?.("change", () => viewportCoordinator.schedule(), { passive: true });
 
 function initializeCoreUI() {
   const required = { stage, camera, overlay, cameraState, status, imageInput, dockImageInput, cameraButton };
@@ -844,13 +1288,15 @@ function initializeOptionalSystems() {
 }
 
 try {
+  recordBetaEvent("boot", { visibility: document.visibilityState });
   bindEventListeners();
   initializeCoreUI();
+  bindBetaDiagnostics();
   initializeImageImport();
-  initializeCamera();
+    initializeCamera();
   initializeOptionalSystems();
-  registerPWA({ onUpdate: update => { pendingPWAUpdate = update; if (updateAction) updateAction.hidden = false; status.textContent = "Update available. Apply it when ready."; } });
-  if (!visionLoopStarted) { visionLoopStarted = true; requestVisionFrame(); }
+  registerPWA({ onUpdate: update => { recordBetaEvent("service-worker-update", {}); pendingPWAUpdate = update; if (updateAction) updateAction.hidden = false; status.textContent = "Update available. Apply it when ready."; } }).then(registration => { recordBetaEvent("service-worker-registration", { supported: Boolean(registration) }); });
+  startVisionLoop();
 } catch (error) {
   console.error("[TraceLens core] initialization failed", error);
   if (status) status.textContent = "TraceLens could not initialize. Refresh and try again.";

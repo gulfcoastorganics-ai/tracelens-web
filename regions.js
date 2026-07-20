@@ -1,3 +1,4 @@
+/** Region authoring state; points are normalized so regions survive resizing. */
 const REGION_LIMIT = 64;
 
 export const REGION_SHAPES = Object.freeze(["rectangle", "polygon", "freeform"]);

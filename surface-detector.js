@@ -1,3 +1,8 @@
+/**
+ * Low-resolution rectangular-surface detector.
+ * It intentionally trades geometric completeness for predictable CPU use;
+ * `SurfaceTracker` supplies temporal stability and lock hysteresis afterward.
+ */
 import { VisionUtils } from "./vision-utils.js";
 import { validateQuad } from "./quad-geometry.js";
 
@@ -12,6 +17,7 @@ export class SurfaceDetector {
     this.lastResult = null;
   }
 
+  /** Start sampling a video element; repeated starts for the same element are safe. */
   start(video) {
     if (this.running && this.video === video) return;
     this.video = video;
@@ -19,6 +25,7 @@ export class SurfaceDetector {
     this.tick();
   }
 
+  /** Stop future animation-frame samples. Existing result data is retained. */
   stop() { this.running = false; }
 
   tick = (now = performance.now()) => {
@@ -31,6 +38,7 @@ export class SurfaceDetector {
     requestAnimationFrame(this.tick);
   };
 
+  /** Analyze one reduced frame and return a normalized quad/confidence result. */
   detect() {
     if (!this.video?.videoWidth || this.video.readyState < 2) return { found: false, confidence: 0, rejection: "camera-not-ready" };
     const canvas = this.vision.canvas;

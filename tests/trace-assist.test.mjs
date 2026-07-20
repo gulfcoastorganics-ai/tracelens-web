@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { summarizeTrace } from "../trace-analysis.js";
 import { grayscale, adjustContrast, threshold, posterize, sobelEdges, composeTrace } from "../trace-filters.js";
 import { TraceCache, traceCacheKey } from "../trace-cache.js";
 import { TRACE_STAGES, getTraceStage } from "../trace-stages.js";
@@ -52,3 +53,9 @@ globalThis.Image = class FakeTraceImage { constructor() { this.naturalWidth = 4;
 globalThis.document = { createElement() { return { width: 0, height: 0, getContext() { return { drawImage() {}, getImageData: () => ({ data: new Uint8ClampedArray(4 * 4 * 4), width: 4, height: 4 }) }; } }; } };
 const cancellableEngine = new TraceEngine({ resolution: 4 }); const pendingTrace = cancellableEngine.process("data:image/png;base64,test", { mode: "Clean Contour" }); await new Promise(resolve => setTimeout(resolve, 0)); cancellableEngine.cancel(); const cancelledTrace = await pendingTrace; assert.equal(cancelledTrace.cancelled, true); assert.ok(cancellableEngine.diagnostics().cancelledJobs >= 1); cancellableEngine.dispose(); let capturedImage = null; globalThis.ImageData = class FakeImageData { constructor(data, width, height) { this.data = data; this.width = width; this.height = height; } }; globalThis.document = { createElement() { return { width: 0, height: 0, toDataURL() { return "data:image/png;base64,test"; }, getContext() { return { putImageData(image) { capturedImage = image; } }; } }; } }; await resultToDataUrl({ data: new Uint8ClampedArray([100, 100, 100, 255, 250, 250, 250, 255]), width: 2, height: 1 }, "transparent", "Shadow Blocks"); assert.equal(capturedImage.data[0], 100); globalThis.Worker = originalWorker; globalThis.Image = originalImage; globalThis.document = originalDocument; globalThis.ImageData = originalImageData;
 console.log("trace assist tests passed");
+const summary = summarizeTrace({ width: 100, height: 100, contours: [{ points: [{ x: 0, y: 0 }] }], lines: [{ points: [{ x: 0, y: 0 }, { x: 30, y: 40 }] }], quality: { score: 84 } });
+assert.deepEqual(summary, { contourCount: 1, lineCount: 1, totalLength: 50, coverage: 0.0625, quality: 84 });
+const malformedSummary = summarizeTrace({ width: 100, height: 100, lines: [{ points: [{ x: 0, y: 0 }, { x: undefined, y: 1 }, { x: 0, y: 0 }] }] });
+assert.equal(malformedSummary.totalLength, 0);
+assert.equal(malformedSummary.coverage, 0);
+assert.equal(summarizeTrace({ width: 0, height: 0, lines: [] }).coverage, 0);

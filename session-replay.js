@@ -1,3 +1,4 @@
+/** Append-only session timeline used for diagnostics and deterministic replay. */
 const SESSION_LIMIT = 500;
 
 export const SESSION_STATES = Object.freeze(["idle", "recording", "paused", "stopped"]);

@@ -8,6 +8,7 @@ export const DEFAULT_FEATURE_FLAGS = Object.freeze({
   ghostStroke: false,
   voiceCommands: false,
   drawingComparison: true,
+  diagnostics: true,
   sessionReplay: false,
   templateCreation: false,
   experimentalAnalysis: false

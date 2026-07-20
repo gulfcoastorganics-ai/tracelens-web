@@ -1,3 +1,9 @@
+/**
+ * Workflow state graph for the browser runtime.
+ * `app.js` owns orchestration; this module only validates transitions and
+ * records them for diagnostics. Invalid transitions must not partially mutate
+ * state.
+ */
 export const APP_STATES = Object.freeze([
   "Booting", "Home", "Importing", "PreparingImage", "ScanningSurface", "Calibrating",
   "Positioning", "Tracing", "Paused", "Reviewing", "Comparing", "Exporting", "Saving", "Recovering", "Error"
@@ -22,6 +28,7 @@ const DEFAULT_TRANSITIONS = Object.freeze({
 });
 
 export class AppStateMachine {
+  /** Create a state machine with an explicit initial state and transition graph. */
   constructor({ initial = "Booting", transitions = DEFAULT_TRANSITIONS, onTransition, onInvalid } = {}) {
     if (!APP_STATES.includes(initial)) throw new Error(`Unknown application state: ${initial}`);
     this.state = initial;
@@ -31,8 +38,13 @@ export class AppStateMachine {
     this.history = [];
   }
 
+  /** Return whether `next` is legal from the current state without mutating. */
   canTransition(next) { return APP_STATES.includes(next) && (next === this.state || this.transitions[this.state]?.includes(next)); }
 
+  /**
+   * Apply a legal transition and notify listeners.
+   * @throws {Error} when the target is not in the configured graph.
+   */
   transition(next, meta = {}) {
     if (!this.canTransition(next)) {
       const error = new Error(`Invalid application transition: ${this.state} → ${next}`);
@@ -47,7 +59,9 @@ export class AppStateMachine {
     return event;
   }
 
+  /** Attempt a transition for UI actions where invalid input is recoverable. */
   tryTransition(next, meta = {}) { try { return this.transition(next, meta); } catch { return null; } }
 
+  /** Reset state and history, typically for a new workspace/session. */
   reset(initial = "Booting") { if (!APP_STATES.includes(initial)) throw new Error(`Unknown application state: ${initial}`); this.state = initial; this.history.length = 0; }
 }

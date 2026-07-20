@@ -1,5 +1,6 @@
 export function classifyCameraError(error, { secureContext = globalThis.isSecureContext } = {}) {
   const name = error?.name || "";
+  if (error?.cameraCode === "metadata-timeout") return { code: "metadata-timeout", message: "Camera started but did not provide a usable video frame. Retry or import an image." };
   if (secureContext === false) return { code: "insecure-context", message: "Camera requires an HTTPS page." };
   if (name === "NotAllowedError" || name === "PermissionDeniedError") return { code: "permission-denied", message: "Camera permission was denied. Allow access or use Import." };
   if (name === "NotFoundError" || name === "DevicesNotFoundError") return { code: "no-device", message: "No camera was found. Import an image instead." };
