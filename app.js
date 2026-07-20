@@ -49,6 +49,7 @@ import { DEFAULT_GHOST_BRUSH, appendGhostBrushTrail, ghostBrushChanged, ghostBru
 import { BetaDiagnostics, downloadDiagnosticReport, normalizeDiagnosticViewport } from "./beta-diagnostics.js";
 import { waitForVideoMetadata } from "./camera-lifecycle.js";
 import { createViewportCoordinator } from "./viewport-coordinator.js";
+import { imageDisplayName, isSupportedImageFile } from "./image-import.js";
 
 const camera = document.querySelector("#camera");
 const overlay = document.querySelector("#overlay");
@@ -1023,7 +1024,7 @@ function loadImage(file) {
   const importRequest = ++imageImportToken;
   projectOperationToken += 1;
   if (pendingImageReader) { try { pendingImageReader.abort(); } catch {} pendingImageReader = null; }
-  if (!file.type?.startsWith("image/")) { status.textContent = "Choose a supported image file."; return; }
+  if (!isSupportedImageFile(file)) { status.textContent = "Choose a supported image file."; return; }
   if (file.size > 25 * 1024 * 1024) { status.textContent = "That image is larger than 25 MB. Choose a smaller file."; return; }
   releaseGhostInteraction(); releaseCompareInteraction({ restore: true }); releaseGhostBrushInteraction({ clearTrail: true }); compareDifferenceToken += 1; compareDifferenceResult = null; compareState = normalizeGhostCompare({ ...compareState, enabled: false });
   transitionAppState("Importing", "image selected");
@@ -1036,7 +1037,7 @@ function loadImage(file) {
     perspectiveActive = false;
     surfaceTracker.unlock(); surfaceTracker.cancelScan(); perspectiveSession.cancel(); autoPerspectiveScanning = false; autoPerspectiveButton?.classList.remove("active");
     syncActiveLayer();
-    const newLayer = createLayer({ image: reader.result, name: file.name.replace(/\.[^/.]+$/, "") });
+    const newLayer = createLayer({ image: reader.result, name: imageDisplayName(file.name) });
     setLayers([...layers, newLayer], newLayer.id);
     projectLibrary.thumbnail(reader.result).then(thumbnail => { const layer = layers.find(item => item.id === newLayer.id); if (layer) layer.thumbnail = thumbnail; renderLayerList(); }).catch(error => console.warn("[TraceLens layers] thumbnail generation failed", error));
     overlay.style.display = "block";
@@ -1056,7 +1057,16 @@ function loadImage(file) {
     transitionAppState("Positioning", "reference ready");
   };
   reader.onerror = () => { if (importRequest !== imageImportToken) return; pendingImageReader = null; recordBetaEvent("image-import-failure", { reason: "read-failed" }); betaDiagnostics.error("Could not read image", { source: "image-import" }); transitionAppState("Error", "image read failed"); status.textContent = "Could not read that image. Try another file."; console.error("[TraceLens import] FileReader failed", reader.error); };
-  reader.readAsDataURL(file);
+  try {
+    reader.readAsDataURL(file);
+  } catch (error) {
+    if (importRequest !== imageImportToken) return;
+    pendingImageReader = null;
+    recordBetaEvent("image-import-failure", { reason: "read-start-failed" });
+    betaDiagnostics.error("Could not start image read", { source: "image-import" });
+    transitionAppState("Error", "image read could not start");
+    status.textContent = "Could not read that image. Try another file.";
+  }
 }
 
 function bindEventListeners() {

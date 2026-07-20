@@ -3,7 +3,7 @@ const SHELL = ["./", "./index.html", "./style.css", "./manifest.webmanifest", ".
 self.addEventListener("install", event => event.waitUntil(caches.open(CACHE).then(async cache => {
   // Install the shell atomically, but keep one unavailable optional module from
   // making the entire PWA fail to install on a partial/static deployment.
-  await Promise.all(SHELL.concat(["./camera-lifecycle.js", "./viewport-coordinator.js"]).map(async asset => {
+  await Promise.all(SHELL.concat(["./camera-lifecycle.js", "./viewport-coordinator.js", "./image-import.js"]).map(async asset => {
     try { await cache.add(asset); } catch (error) { console.warn("[TraceLens SW] skipped asset", asset, error); }
   }));
 })));

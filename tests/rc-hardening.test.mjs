@@ -25,6 +25,8 @@ test("camera, image import, and save operations reject stale completions", () =>
   assert.match(app, /pendingImageReader\.abort/);
   assert.match(app, /projectOperationToken/);
   assert.match(app, /operation !== projectOperationToken/);
+  assert.match(app, /isSupportedImageFile/);
+  assert.match(app, /read-start-failed/);
 });
 
 test("corrupt thumbnail assets fail safely", () => {
@@ -44,6 +46,7 @@ test("beta diagnostics is cached and enabled by a deterministic release flag", (
   assert.match(flags, /diagnostics: true/);
   assert.match(app, /betaDiagnosticsPanel/);
   assert.match(app, /downloadDiagnosticReport/);
+  assert.match(sw, /image-import\.js/);
 });
 
 test("repeated onboarding display clears prior timers", () => {
