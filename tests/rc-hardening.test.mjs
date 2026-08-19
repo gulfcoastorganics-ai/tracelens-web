@@ -5,10 +5,10 @@ import path from "node:path";
 import { GestureCoach } from "../onboarding.js";
 
 const root = path.resolve(process.cwd());
-const app = fs.readFileSync(path.join(root, "web/app.js"), "utf8");
-const library = fs.readFileSync(path.join(root, "web/project-library.js"), "utf8");
-const pwa = fs.readFileSync(path.join(root, "web/pwa.js"), "utf8");
-const sw = fs.readFileSync(path.join(root, "web/sw.js"), "utf8");
+const app = fs.readFileSync(path.join(root, "app.js"), "utf8");
+const library = fs.readFileSync(path.join(root, "project-library.js"), "utf8");
+const pwa = fs.readFileSync(path.join(root, "pwa.js"), "utf8");
+const sw = fs.readFileSync(path.join(root, "sw.js"), "utf8");
 
 test("diagnostics animation loop has explicit start/stop ownership", () => {
   assert.match(app, /function startVisionLoop\(\)/);
@@ -41,7 +41,7 @@ test("repeated PWA initialization shares one registration promise", () => {
 });
 
 test("beta diagnostics is cached and enabled by a deterministic release flag", () => {
-  const flags = fs.readFileSync(path.join(root, "web/feature-flags.js"), "utf8");
+  const flags = fs.readFileSync(path.join(root, "feature-flags.js"), "utf8");
   assert.match(sw, /beta-diagnostics\.js/);
   assert.match(flags, /diagnostics: true/);
   assert.match(app, /betaDiagnosticsPanel/);
