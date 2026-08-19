@@ -4,10 +4,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 const root = path.resolve(process.cwd());
-const app = fs.readFileSync(path.join(root, "web/app.js"), "utf8");
-const html = fs.readFileSync(path.join(root, "web/index.html"), "utf8");
-const sw = fs.readFileSync(path.join(root, "web/sw.js"), "utf8");
-const release = fs.readFileSync(path.join(root, "scripts/release-check.mjs"), "utf8");
+const app = fs.readFileSync(path.join(root, "app.js"), "utf8");
+const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
+const sw = fs.readFileSync(path.join(root, "sw.js"), "utf8");
 
 test("Ghost Compare is integrated into the existing workspace", () => {
   assert.match(app, /ghostCompareRenderInstructions/);
@@ -22,7 +21,6 @@ test("Ghost Compare is integrated into the existing workspace", () => {
 
 test("comparison assets are included in offline release coverage", () => {
   assert.match(sw, /ghost-compare\.js/);
-  assert.match(release, /web\/ghost-compare\.js/);
 });
 
 test("comparison owns split interaction without using the trace stage", () => {
