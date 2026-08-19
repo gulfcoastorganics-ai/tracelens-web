@@ -9,23 +9,41 @@ TraceLens is a camera-first browser tool for aligning a reference image with a l
 - Opacity, scale, rotation, position, blend modes, guides, and alignment workflows
 - Perspective alignment, trace-assist modes, comparison views, session/workspace persistence, and diagnostic surfaces
 
+## Requirements
+
+- Node.js 20+
+- A modern browser with camera/media support
+- HTTPS or localhost when using live camera access
+
 ## Run locally
 
-This repository is a static web app. Serve the repository root with a local HTTP server, then open the printed URL in a browser. Camera access requires a secure context such as HTTPS or localhost.
+The project has no runtime dependencies. Start the included zero-dependency static server:
 
-No package manager or build script is currently documented in the repository. Add a reproducible setup command before presenting this project as a packaged application.
+```bash
+npm run dev
+```
+
+The default URL is `http://127.0.0.1:8080`. Override `HOST` or `PORT` through the process environment when needed.
 
 ## Testing
 
-The repository includes a `tests/` directory. The current repository does not document a single test command or CI status; add those details when the test workflow is standardized.
+```bash
+npm test
+```
+
+The test command runs the behavior-focused `tests/*.test.mjs` suite with Node's built-in test runner. GitHub Actions runs the same command for pushes and pull requests targeting `main`.
 
 ## Architecture
 
 - `index.html`: application shell and accessible UI landmarks
 - `app.js`: camera lifecycle, overlay interaction, workspace state, and feature orchestration
-- `tests/`: behavior-focused test assets
+- focused root modules: camera, comparison, diagnostics, calibration, overlay, state, and workflow behavior
+- `tests/`: Node-based behavior and integration tests
 - `manifest.webmanifest`: installable PWA metadata
+- `scripts/serve.mjs`: local static development server
 
-## Demo and screenshots
+## Release gate
 
-No verified live demo or screenshot assets are currently linked here. Add a public demo URL and a small set of current screenshots when available.
+Automated tests cover the pure-JavaScript behavior, but camera permission, device switching, PWA install behavior, and visual overlay alignment still require a real-browser/device pass before calling a deployment fully verified.
+
+A public demo URL and current screenshots remain presentation tasks; they are not required to run or test the repository locally.
