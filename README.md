@@ -7,11 +7,11 @@ TraceLens is a camera-first browser tool for aligning a reference image with a l
 - Live camera preview with front/rear camera switching
 - Reference-image import and adjustable overlay controls
 - Opacity, scale, rotation, position, blend modes, guides, and alignment workflows
-- Perspective alignment, trace-assist modes, comparison views, session/workspace persistence, and diagnostic surfaces
+- Perspective alignment, trace-assist modes, comparison views, session/workspace state, and diagnostic surfaces
 
 ## Requirements
 
-- Node.js 20+
+- Node.js 20+ for local development/testing
 - A modern browser with camera/media support
 - HTTPS or localhost when using live camera access
 
@@ -33,6 +33,10 @@ npm test
 
 The test command runs the behavior-focused `tests/*.test.mjs` suite with Node's built-in test runner. GitHub Actions runs the same command for pushes and pull requests targeting `main`.
 
+## Deployment
+
+Pushes to `main` are tested, staged as a static site, and deployed through `.github/workflows/deploy-pages.yml`. The manifest uses relative start/scope/icon URLs so the PWA metadata remains valid when hosted from a project subpath.
+
 ## Architecture
 
 - `index.html`: application shell and accessible UI landmarks
@@ -42,8 +46,6 @@ The test command runs the behavior-focused `tests/*.test.mjs` suite with Node's 
 - `manifest.webmanifest`: installable PWA metadata
 - `scripts/serve.mjs`: local static development server
 
-## Release gate
+## Release status
 
-Automated tests cover the pure-JavaScript behavior, but camera permission, device switching, PWA install behavior, and visual overlay alignment still require a real-browser/device pass before calling a deployment fully verified.
-
-A public demo URL and current screenshots remain presentation tasks; they are not required to run or test the repository locally.
+The repository is configured for continuous static deployment. Automated behavior is CI-gated. Camera permissions, device switching, install behavior, and visual overlay alignment remain target-device acceptance checks because they depend on real browser hardware rather than the repository build.
