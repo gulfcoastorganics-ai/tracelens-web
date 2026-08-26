@@ -18,4 +18,25 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm test
+      - name: Validate JavaScript syntax
+        run: |
+          find . -maxdepth 2 -type f -name '*.js' -o -name '*.mjs' | while read -r file; do
+            node --check "$file"
+          done
+      - name: Run release checks
+        run: npm run check
+      - name: Smoke static server
+        run: |
+          npm start >/tmp/tracelens-server.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+          for i in {1..20}; do
+            if curl --fail --silent --show-error http://127.0.0.1:8080/ >/tmp/tracelens-index.html; then
+              break
+            fi
+            sleep 0.25
+          done
+          test -s /tmp/tracelens-index.html
+          grep -qi 'TraceLens' /tmp/tracelens-index.html
+          curl --fail --silent --show-error http://127.0.0.1:8080/manifest.webmanifest >/tmp/tracelens-manifest.json
+          node -e "JSON.parse(require('fs').readFileSync('/tmp/tracelens-manifest.json','utf8'))"

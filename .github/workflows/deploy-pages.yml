@@ -22,13 +22,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Use Node.js 20
+      - name: Use Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
-      - name: Test
-        run: npm test
+      - name: Release checks
+        run: npm run check
 
       - name: Stage static site
         run: |
@@ -42,6 +42,9 @@ jobs:
             --exclude 'README.md' \
             --exclude 'package.json' \
             --exclude 'package-lock.json'
+          test -s _site/index.html
+          test -s _site/manifest.webmanifest
+          test -s _site/icon.svg
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
