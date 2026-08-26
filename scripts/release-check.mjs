@@ -3,7 +3,7 @@ import { readFile, stat } from 'node:fs/promises';
 const required = [
   'index.html',
   'app.js',
-  'styles.css',
+  'style.css',
   'manifest.webmanifest',
   'icon.svg',
   'camera-errors.js',
